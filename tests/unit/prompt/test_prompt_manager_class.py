@@ -37,15 +37,22 @@ class TestPromptManager:
         assert pm.use_chat_template is False
         assert pm.tokenizer is None
         assert pm.system_prompt is None
+        assert pm.chat_template_kwargs == {}
 
     def test_init_with_chat_template(self):
         """Test PromptManager initialization with chat template enabled."""
         tokenizer = Mock()
         system_prompt = "You are a helpful assistant."
-        pm = PromptManager(use_chat_template=True, tokenizer=tokenizer, system_prompt=system_prompt)
+        pm = PromptManager(
+            use_chat_template=True,
+            tokenizer=tokenizer,
+            system_prompt=system_prompt,
+            chat_template_kwargs={"enable_thinking": False},
+        )
         assert pm.use_chat_template is True
         assert pm.tokenizer == tokenizer
         assert pm.system_prompt == system_prompt
+        assert pm.chat_template_kwargs == {"enable_thinking": False}
 
     def test_prepare_prompt_plain_text_basic(self):
         """Test prepare_prompt with plain text format and basic document."""
@@ -136,6 +143,24 @@ class TestPromptManager:
         result = pm.prepare_prompt(doc)
         assert result == "<|user|>\nWhat is 2+2?<|assistant|>"
         tokenizer.apply_chat_template.assert_called_once()
+
+    def test_prepare_prompt_chat_template_passes_chat_template_kwargs(self):
+        """Test prepare_prompt forwards chat_template_kwargs to apply_chat_template."""
+        tokenizer = Mock()
+        tokenizer.apply_chat_template.return_value = "<|user|>\nWhat is 2+2?<|assistant|>"
+
+        pm = PromptManager(
+            use_chat_template=True,
+            tokenizer=tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        doc = Doc(query="What is 2+2?", choices=["3", "4", "5"], gold_index=1)
+
+        result = pm.prepare_prompt(doc)
+        assert result == "<|user|>\nWhat is 2+2?<|assistant|>"
+
+        call_args = tokenizer.apply_chat_template.call_args
+        assert call_args.kwargs["enable_thinking"] is False
 
     def test_prepare_prompt_chat_template_with_system_prompt(self):
         """Test prepare_prompt with chat template format and system prompt."""
@@ -348,6 +373,28 @@ class TestPromptManager:
         assert messages[0]["content"][0]["text"] == "What is in this image?"
         assert messages[0]["content"][1]["type"] == "image"
         assert messages[0]["content"][1]["image"] == mock_image
+
+    def test_prepare_prompt_multimodal_passes_chat_template_kwargs(self):
+        """Test prepare_prompt_multimodal forwards chat_template_kwargs to apply_chat_template."""
+        tokenizer = Mock()
+        tokenizer.apply_chat_template.return_value = "<|user|>\n<image>What is in this image?<|assistant|>"
+
+        pm = PromptManager(
+            use_chat_template=True,
+            tokenizer=tokenizer,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+        mock_image = Mock()
+        doc = Doc(
+            query="What is in this image?", choices=["A cat", "A dog", "A bird"], gold_index=0, images=[mock_image]
+        )
+
+        result = pm.prepare_prompt_multimodal(doc)
+        assert result == "<|user|>\n<image>What is in this image?<|assistant|>"
+
+        call_args = tokenizer.apply_chat_template.call_args
+        assert call_args.kwargs["enable_thinking"] is False
 
     def test_prepare_prompt_multimodal_with_system_prompt(self):
         """Test prepare_prompt_multimodal with system prompt."""
