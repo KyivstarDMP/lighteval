@@ -25,6 +25,16 @@ from transformers import AutoTokenizer
 from lighteval.models.dummy.dummy_model import DummyModel, DummyModelConfig
 
 
+def test_model_config_from_args_parses_chat_template_kwargs():
+    config = DummyModelConfig.from_args(
+        "model_name=dummy,chat_template_kwargs={enable_thinking:false},generation_parameters={temperature:0.7}"
+    )
+
+    assert config.model_name == "dummy"
+    assert config.chat_template_kwargs == {"enable_thinking": False}
+    assert config.generation_parameters.temperature == 0.7
+
+
 def test_tok_encode_pair():
     model = DummyModel(config=DummyModelConfig(seed=42))
     model._tokenizer = AutoTokenizer.from_pretrained("facebook/xglm-564M")

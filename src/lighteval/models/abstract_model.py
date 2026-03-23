@@ -23,11 +23,11 @@
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import torch
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokenizerBase
 
 from lighteval.models.model_input import GenerationParameters
@@ -86,6 +86,7 @@ class ModelConfig(BaseModel, extra="forbid"):
 
     generation_parameters: GenerationParameters = GenerationParameters()
     system_prompt: str | None = None
+    chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     cache_dir: str = "~/.cache/huggingface/lighteval"
 
     @classmethod
@@ -133,24 +134,36 @@ class ModelConfig(BaseModel, extra="forbid"):
                 'model': {'model_name': 'gpt2', 'use_cache': True, 'generation_parameters': {'temperature': 0.7}},
             }
         """
-        # Looking for generation_parameters in the model_args
-        generation_parameters_dict = None
-        pattern = re.compile(r"(\w+)=(\{.*\}|[^,]+)")
-        matches = pattern.findall(args)
-        for key, value in matches:
-            key = key.strip()
-            if key == "generation_parameters":
-                # Keys must be quoted (since they are strings)
-                gen_params = re.sub(r"(\w+):", r'"\1":', value)
-                # for k, v where v are strings, we quote them too
-                gen_params = re.sub(r":\s*([A-Za-z_][\w.-]*)\s*(?=[,}])", r':"\1"', gen_params)
-                generation_parameters_dict = json.loads(gen_params)
+
+        def _parse_inline_dict(value: str) -> dict:
+            def _quote_bareword_value(match: re.Match) -> str:
+                bareword = match.group(1)
+                if bareword in {"true", "false", "null"}:
+                    return ":" + bareword
+                return f':"{bareword}"'
+
+            parsed = re.sub(r"(\w+):", r'"\1":', value)
+            parsed = re.sub(r":\s*([A-Za-z_][\w.-]*)\s*(?=[,}])", _quote_bareword_value, parsed)
+            return json.loads(parsed)
+
+        def _extract_inline_dict(raw_args: str, field_name: str) -> dict | None:
+            match = re.search(rf"{field_name}=(\{{.*?\}})(?:,|$)", raw_args)
+            if match is None:
+                return None
+            return _parse_inline_dict(match.group(1))
+
+        # Looking for generation_parameters and chat_template_kwargs in the model_args
+        generation_parameters_dict = _extract_inline_dict(args, "generation_parameters")
+        chat_template_kwargs_dict = _extract_inline_dict(args, "chat_template_kwargs")
 
         args = re.sub(r"generation_parameters=\{.*?\},?", "", args).strip(",")
+        args = re.sub(r"chat_template_kwargs=\{.*?\},?", "", args).strip(",")
         model_config = {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in args.split(",")}
 
         if generation_parameters_dict is not None:
             model_config["generation_parameters"] = generation_parameters_dict
+        if chat_template_kwargs_dict is not None:
+            model_config["chat_template_kwargs"] = chat_template_kwargs_dict
 
         return model_config
 
