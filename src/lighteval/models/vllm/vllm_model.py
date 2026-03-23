@@ -180,6 +180,7 @@ class VLLMModelConfig(ModelConfig):
     subfolder: str | None = None
     is_async: bool = False  # Whether to use the async version or sync version of the model
     override_chat_template: bool = None
+    skip_mm_profiling: bool = False
 
 
 @requires("vllm")
@@ -264,6 +265,7 @@ class VLLMModel(LightevalModel):
             "max_num_seqs": int(config.max_num_seqs),
             "max_num_batched_tokens": int(config.max_num_batched_tokens),
             "enforce_eager": True,
+            "skip_mm_profiling": config.skip_mm_profiling,
         }
 
         if config.quantization is not None:
@@ -582,6 +584,7 @@ class AsyncVLLMModel(VLLMModel):
             "max_num_seqs": int(config.max_num_seqs),
             "max_num_batched_tokens": int(config.max_num_batched_tokens),
             "enforce_eager": True,
+            "skip_mm_profiling": config.skip_mm_profiling,
         }
 
         if config.data_parallel_size > 1:
