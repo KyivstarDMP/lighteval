@@ -181,6 +181,8 @@ class VLLMModelConfig(ModelConfig):
     is_async: bool = False  # Whether to use the async version or sync version of the model
     override_chat_template: bool = None
     skip_mm_profiling: bool = False
+    attention_backend: str | None = None
+    mm_encoder_attn_backend: str | None = None
 
 
 @requires("vllm")
@@ -272,6 +274,10 @@ class VLLMModel(LightevalModel):
             self.model_args["quantization"] = config.quantization
         if config.load_format is not None:
             self.model_args["load_format"] = config.load_format
+        if config.attention_backend is not None:
+            self.model_args["attention_backend"] = config.attention_backend
+        if config.mm_encoder_attn_backend is not None:
+            self.model_args["mm_encoder_attn_backend"] = config.mm_encoder_attn_backend
 
         if config.data_parallel_size > 1:
             self.model_args["distributed_executor_backend"] = "ray"
@@ -586,6 +592,10 @@ class AsyncVLLMModel(VLLMModel):
             "enforce_eager": True,
             "skip_mm_profiling": config.skip_mm_profiling,
         }
+        if config.attention_backend is not None:
+            self.model_args["attention_backend"] = config.attention_backend
+        if config.mm_encoder_attn_backend is not None:
+            self.model_args["mm_encoder_attn_backend"] = config.mm_encoder_attn_backend
 
         if config.data_parallel_size > 1:
             self._batch_size = "auto"
