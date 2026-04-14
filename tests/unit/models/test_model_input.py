@@ -71,6 +71,11 @@ class TestGenerationParameters:
 
         assert gen.to_vllm_dict() == {"max_tokens": 128, "temperature": 0.1}
 
+    def test_vllm_dict_includes_skip_special_tokens(self):
+        gen = GenerationParameters(max_new_tokens=128, temperature=0.1, skip_special_tokens=False)
+
+        assert gen.to_vllm_dict() == {"max_tokens": 128, "temperature": 0.1, "skip_special_tokens": False}
+
     def test_vllm_openai_dict_excludes_reasoning_effort(self):
         gen = GenerationParameters(max_new_tokens=128, temperature=0.1, reasoning_effort="low")
 
