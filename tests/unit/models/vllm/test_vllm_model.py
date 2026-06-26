@@ -23,9 +23,11 @@
 import unittest
 from unittest.mock import Mock, patch
 
+from PIL import Image
 from transformers import AutoTokenizer
 
 from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig
+from lighteval.tasks.requests import Doc
 
 
 class TestVLLMTokenizerCreation(unittest.TestCase):
@@ -60,3 +62,81 @@ class TestVLLMModelUseChatTemplate(unittest.TestCase):
 
                 self.assertEqual(model.use_chat_template, expected_result)
                 self.assertEqual(model.use_chat_template, model._tokenizer.chat_template is not None)
+
+
+class TestVLLMMultimodalPayload(unittest.TestCase):
+    """The image carried by a Doc must survive into the vLLM prompt payload as
+    ``multi_modal_data`` for every vLLM code path (generative and loglikelihood)."""
+
+    @staticmethod
+    def _bare_model() -> VLLMModel:
+        model = VLLMModel.__new__(VLLMModel)
+        model.DATASET_SPLITS = 1
+        model.use_chat_template = True
+        model.prompt_manager = Mock()
+        return model
+
+    def test_greedy_until_attaches_images_to_payload(self):
+        model = self._bare_model()
+        model.config = Mock()
+        model.config.generation_parameters.max_new_tokens = 16
+        model._max_length = None  # all-image split -> no tokenization/truncation
+        model.prompt_manager.prepare_prompt_multimodal.return_value = "Question <start_of_image>"
+
+        image = Image.new("RGB", (4, 4), (255, 0, 0))
+        doc = Doc(query="q", choices=[], gold_index=0, images=[image], generation_size=16)
+
+        captured = {}
+
+        def fake_generate(inputs, **kwargs):
+            captured["inputs"] = inputs
+            output = Mock()
+            output.outputs = [Mock(token_ids=[1], text="Відповідь: А")]
+            output.prompt_token_ids = [1, 2, 3]
+            return [output]
+
+        model._generate = fake_generate
+        model._greedy_until([doc])
+
+        payload = captured["inputs"][0]
+        self.assertIsInstance(payload, dict)
+        self.assertEqual(payload["prompt"], "Question <start_of_image>")
+        self.assertEqual(payload["multi_modal_data"]["image"], [image])
+
+    def test_loglikelihood_attaches_images_to_payload(self):
+        model = self._bare_model()
+        model._tokenizer = AutoTokenizer.from_pretrained("gpt2")
+        model._add_special_tokens = False
+        model.pairwise_tokenization = False
+        model.prompt_manager.prepare_prompt_multimodal.return_value = "Question <start_of_image>\n"
+
+        image = Image.new("RGB", (4, 4), (0, 255, 0))
+        doc = Doc(query="q", choices=["А", "Б"], gold_index=0, images=[image])
+
+        captured = {}
+
+        class _AnyLogprobs(dict):
+            """Returns a rank-1 logprob for whatever continuation token is queried."""
+
+            def __getitem__(self, _token):
+                return Mock(rank=1, logprob=-0.1)
+
+        def fake_generate(inputs, **kwargs):
+            captured["inputs"] = inputs
+            outputs = []
+            for _ in inputs:
+                output = Mock()
+                output.prompt_token_ids = list(range(32))
+                output.prompt_logprobs = [_AnyLogprobs() for _ in range(32)]
+                outputs.append(output)
+            return outputs
+
+        model._generate = fake_generate
+        model._loglikelihood_tokens([doc])
+
+        # One payload per choice, each a multimodal dict carrying the image.
+        self.assertEqual(len(captured["inputs"]), len(doc.choices))
+        for payload in captured["inputs"]:
+            self.assertIsInstance(payload, dict)
+            self.assertTrue(payload["prompt"].startswith("Question <start_of_image>"))
+            self.assertEqual(payload["multi_modal_data"]["image"], [image])
