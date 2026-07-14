@@ -222,6 +222,7 @@ class VLLMModel(LightevalModel):
             self.tokenizer,
             config.system_prompt,
             config.chat_template_kwargs,
+            config.image_placement,
         )
 
         # Initialize cache for tokenization and predictions

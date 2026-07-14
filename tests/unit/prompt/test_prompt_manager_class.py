@@ -24,7 +24,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from lighteval.tasks.prompt_manager import PromptManager
+from lighteval.tasks.prompt_manager import ImagePlacement, PromptManager, order_multimodal_content
 from lighteval.tasks.requests import Doc
 
 
@@ -508,3 +508,76 @@ class TestPromptManager:
         result = pm.prepare_prompt(doc)
         expected = f"{instruction}\n\nWhat is 1+1? 2\n\nWhat is 2+2?"
         assert result == expected
+
+
+class TestOrderMultimodalContentPlacement:
+    """Test suite for ``order_multimodal_content``'s ``placement`` modes."""
+
+    def test_inline_binds_marker_positionally(self):
+        image_parts = [{"type": "image", "image": "IMG"}]
+        content = order_multimodal_content("before <image> after", image_parts)
+        assert [c["type"] for c in content] == ["text", "image", "text"]
+        assert content[0]["text"] == "before "
+        assert content[2]["text"] == " after"
+
+    def test_inline_with_no_marker_prepends(self):
+        image_parts = [{"type": "image", "image": "IMG"}]
+        content = order_multimodal_content("no marker here", image_parts)
+        assert [c["type"] for c in content] == ["image", "text"]
+
+    def test_prepend_attaches_all_images_before_unmodified_text(self):
+        image_parts = [{"type": "image", "image": "IMG1"}, {"type": "image", "image": "IMG2"}]
+        query = "<image 1> Compare with <image 2>."
+        content = order_multimodal_content(query, image_parts, placement=ImagePlacement.prepend)
+
+        assert content[0] == image_parts[0]
+        assert content[1] == image_parts[1]
+        assert content[2] == {"type": "text", "text": query}
+
+    def test_prepend_accepts_plain_string(self):
+        image_parts = [{"type": "image", "image": "IMG"}]
+        content = order_multimodal_content("<image 1> what is this?", image_parts, placement="prepend")
+        assert content[0]["type"] == "image"
+
+    def test_prepend_keeps_markers_verbatim_as_readable_text(self):
+        image_parts = [{"type": "image", "image": "IMG"}]
+        query = "<image 1> what is this?"
+        content = order_multimodal_content(query, image_parts, placement=ImagePlacement.prepend)
+        assert "<image 1>" in content[-1]["text"]
+
+    def test_rejects_invalid_placement(self):
+        with pytest.raises(ValueError, match="image_placement must be one of"):
+            order_multimodal_content("<image>", [{"type": "image", "image": "IMG"}], placement="sideways")
+
+
+class TestPromptManagerImagePlacement:
+    """Test suite for ``PromptManager``'s ``image_placement`` constructor argument."""
+
+    def test_default_image_placement_is_inline(self):
+        pm = PromptManager()
+        assert pm.image_placement is ImagePlacement.inline
+
+    def test_accepts_enum_member(self):
+        pm = PromptManager(image_placement=ImagePlacement.prepend)
+        assert pm.image_placement is ImagePlacement.prepend
+
+    def test_accepts_plain_string(self):
+        pm = PromptManager(image_placement="prepend")
+        assert pm.image_placement is ImagePlacement.prepend
+
+    def test_does_not_touch_chat_template_kwargs(self):
+        pm = PromptManager(chat_template_kwargs={"enable_thinking": False}, image_placement="prepend")
+        assert pm.chat_template_kwargs == {"enable_thinking": False}
+
+    def test_prepare_prompt_multimodal_does_not_leak_image_placement_into_chat_template_kwargs(self):
+        tokenizer = Mock()
+        tokenizer.apply_chat_template.side_effect = lambda messages, **_kwargs: messages
+
+        pm = PromptManager(use_chat_template=True, tokenizer=tokenizer, image_placement=ImagePlacement.prepend)
+        doc = Doc(query="<image 1> text", choices=["A"], gold_index=0, images=[Mock()])
+
+        content = pm.prepare_prompt_multimodal(doc)[0]["content"]
+        assert content[0]["type"] == "image"  # placement was actually threaded through
+
+        call_kwargs = tokenizer.apply_chat_template.call_args.kwargs
+        assert "image_placement" not in call_kwargs

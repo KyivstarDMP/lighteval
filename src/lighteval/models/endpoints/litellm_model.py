@@ -33,7 +33,7 @@ from tqdm import tqdm
 from lighteval.data import GenerativeTaskDataset
 from lighteval.models.abstract_model import LightevalModel, ModelConfig
 from lighteval.models.model_output import ModelResponse
-from lighteval.tasks.prompt_manager import PromptManager
+from lighteval.tasks.prompt_manager import PromptManager, order_multimodal_content
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.cache_management import SampleCache, cached
 from lighteval.utils.imports import is_package_available, requires
@@ -161,7 +161,11 @@ class LiteLLMClient(LightevalModel):
         litellm.drop_params = True
         litellm.verbose = config.verbose
         self.prompt_manager = PromptManager(
-            use_chat_template=True, tokenizer=self.tokenizer, system_prompt=config.system_prompt
+            use_chat_template=True,
+            tokenizer=self.tokenizer,
+            system_prompt=config.system_prompt,
+            chat_template_kwargs=config.chat_template_kwargs,
+            image_placement=config.image_placement,
         )
 
         # Initialize cache for tokenization and predictions
@@ -187,14 +191,16 @@ class LiteLLMClient(LightevalModel):
         """Build chat messages with the document's images attached to the main user query.
 
         Reuses ``prepare_prompt_api`` for the text/few-shot structure, then converts the last
-        (main query) message into a multimodal content list with ``image_url`` parts.
+        (main query) message into a multimodal content list per ``self.prompt_manager.image_placement``.
         """
         messages = self.prompt_manager.prepare_prompt_api(doc)
         image_parts = [
             {"type": "image_url", "image_url": {"url": self._encode_image_base64(image)}} for image in doc.images
         ]
         last_message = messages[-1]
-        last_message["content"] = [{"type": "text", "text": last_message["content"]}] + image_parts
+        last_message["content"] = order_multimodal_content(
+            last_message["content"], image_parts, placement=self.prompt_manager.image_placement
+        )
         return messages
 
     @staticmethod
