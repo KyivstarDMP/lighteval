@@ -20,14 +20,50 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import sys
 import unittest
+from types import ModuleType
 from unittest.mock import Mock, patch
 
 from PIL import Image
 from transformers import AutoTokenizer
 
-from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig
+from lighteval.models.vllm.vllm_model import VLLMModel, VLLMModelConfig, build_vllm_token_prompts
 from lighteval.tasks.requests import Doc
+
+
+class TestVLLMPromptConstruction(unittest.TestCase):
+    @staticmethod
+    def _fake_vllm_modules():
+        fake_inputs = ModuleType("vllm.inputs")
+        fake_inputs.TokensPrompt = lambda *, prompt_token_ids: {  # noqa: E731
+            "kind": "tokens_prompt",
+            "prompt_token_ids": prompt_token_ids,
+        }
+        fake_vllm = ModuleType("vllm")
+        fake_vllm.inputs = fake_inputs
+        return {"vllm": fake_vllm, "vllm.inputs": fake_inputs}
+
+    def test_build_vllm_token_prompts_uses_tokens_prompt_when_available(self):
+        with patch.dict(sys.modules, self._fake_vllm_modules()):
+            prompts = build_vllm_token_prompts([[1, 2], [3]])
+
+        self.assertEqual(
+            prompts,
+            [
+                {"kind": "tokens_prompt", "prompt_token_ids": [1, 2]},
+                {"kind": "tokens_prompt", "prompt_token_ids": [3]},
+            ],
+        )
+
+    def test_build_vllm_token_prompts_passes_multimodal_dicts_through(self):
+        multimodal = {"prompt": "Question <start_of_image>", "multi_modal_data": {"image": ["img"]}}
+
+        with patch.dict(sys.modules, self._fake_vllm_modules()):
+            prompts = build_vllm_token_prompts([[1, 2], multimodal])
+
+        self.assertEqual(prompts[0], {"kind": "tokens_prompt", "prompt_token_ids": [1, 2]})
+        self.assertIs(prompts[1], multimodal)
 
 
 class TestVLLMTokenizerCreation(unittest.TestCase):
