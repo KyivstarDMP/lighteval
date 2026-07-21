@@ -44,11 +44,17 @@ from lighteval.utils.imports import is_package_available, requires
 logger = logging.getLogger(__name__)
 
 
-def build_vllm_token_prompts(inputs: list[list[int]]) -> list:
-    """Build token prompts across vLLM prompt-schema reorganizations."""
+def build_vllm_token_prompts(inputs: list) -> list:
+    """Build vLLM prompts across prompt-schema reorganizations.
+
+    Text-only items arrive as token-id lists and are wrapped in ``TokensPrompt``;
+    multimodal items arrive as already-built prompt dicts ({"prompt": ...,
+    "multi_modal_data": ...}) and pass through untouched so vLLM's HF processor
+    handles image fusion.
+    """
     from vllm.inputs import TokensPrompt
 
-    return [TokensPrompt(prompt_token_ids=token_ids) for token_ids in inputs]
+    return [item if isinstance(item, dict) else TokensPrompt(prompt_token_ids=item) for item in inputs]
 
 
 if is_package_available("vllm"):
@@ -235,6 +241,7 @@ class VLLMModel(LightevalModel):
             self.tokenizer,
             config.system_prompt,
             config.chat_template_kwargs,
+            config.image_placement,
         )
 
         # Initialize cache for tokenization and predictions
@@ -347,6 +354,16 @@ class VLLMModel(LightevalModel):
         """
         return self._greedy_until(docs)
 
+    @staticmethod
+    def _multimodal_prompt(prompt: str, doc: Doc) -> dict:
+        """Build a vLLM multimodal prompt: chat-template text plus the document's images.
+
+        The text already carries the model's image placeholder tokens (inserted by
+        ``prepare_prompt_multimodal``); vLLM's HF processor expands them and fuses the
+        images supplied in ``multi_modal_data``.
+        """
+        return {"prompt": prompt, "multi_modal_data": {"image": list(doc.images)}}
+
     def _greedy_until(
         self,
         docs: list[Doc],
@@ -373,41 +390,60 @@ class VLLMModel(LightevalModel):
             max_new_tokens = self.config.generation_parameters.max_new_tokens or split[0].generation_size
             num_samples = split[0].num_samples
 
-            context = [self.prompt_manager.prepare_prompt(doc) for doc in split]
-            tokenized = self.tokenizer(context, add_special_tokens=self.add_special_tokens)
+            # Build vLLM prompts per doc: docs carrying images become multimodal prompt
+            # dicts (text + images) handled by vLLM's HF processor, so they are not
+            # pre-tokenized or truncated here; text-only docs follow the token-id path.
+            context = []
+            inputs = []
+            for doc in split:
+                if doc.images:
+                    prompt = self.prompt_manager.prepare_prompt_multimodal(doc)
+                    inputs.append(self._multimodal_prompt(prompt, doc))
+                else:
+                    prompt = self.prompt_manager.prepare_prompt(doc)
+                    inputs.append(None)  # placeholder, filled with token ids below
+                context.append(prompt)
 
-            # The main question for this step is the following:
-            # Would we rather truncate the prompt to allow generation to go to max_new_tokens, at the risk
-            # of losing some meaning, or have some generations that are exceedingly short?
-            # The choice we go for here is to avoid truncating the prompt if we can, since it
-            # should have been managed by the prompt creator/few shot manager if requested by the user.
-            inputs = tokenized["input_ids"]
-            context_size = len(inputs[0])
+            text_indices = [i for i, doc in enumerate(split) if not doc.images]
+            if text_indices:
+                tokenized = self.tokenizer(
+                    [context[i] for i in text_indices], add_special_tokens=self.add_special_tokens
+                )["input_ids"]
 
-            # left truncate the inputs to the maximum length
-            if self.max_length is None:
-                logger.warning(
-                    "The model max_length was not set in the model arguments, so we cannot check if we need to truncate the context."
-                )
-            elif max_new_tokens is not None:
-                if context_size + max_new_tokens > self.max_length:
+                # The main question for this step is the following:
+                # Would we rather truncate the prompt to allow generation to go to max_new_tokens, at the risk
+                # of losing some meaning, or have some generations that are exceedingly short?
+                # The choice we go for here is to avoid truncating the prompt if we can, since it
+                # should have been managed by the prompt creator/few shot manager if requested by the user.
+                context_size = len(tokenized[0])
+
+                # left truncate the inputs to the maximum length
+                if self.max_length is None:
                     logger.warning(
-                        f"{context_size + max_new_tokens=} which is greater than {self.max_length=}. Truncating context to {self.max_length - max_new_tokens} tokens."
+                        "The model max_length was not set in the model arguments, so we cannot check if we need to truncate the context."
                     )
-                    context_size = self.max_length - max_new_tokens
-                    if context_size < 0:
-                        logger.critical(
-                            f"{context_size=} is less than 0, either reduce the max_new_tokens or increase model max length."
+                elif max_new_tokens is not None:
+                    if context_size + max_new_tokens > self.max_length:
+                        logger.warning(
+                            f"{context_size + max_new_tokens=} which is greater than {self.max_length=}. Truncating context to {self.max_length - max_new_tokens} tokens."
                         )
-                        raise ValueError("Context size is less than 0.")
-                    inputs = [input[-context_size:] for input in inputs]
-            else:
-                if context_size > self.max_length:
-                    logger.warning(
-                        f"{context_size=} which is greater than {self.max_length=}. Truncating context to {self.max_length} tokens."
-                    )
-                    context_size = self.max_length
-                    inputs = [input[-context_size:] for input in inputs]
+                        context_size = self.max_length - max_new_tokens
+                        if context_size < 0:
+                            logger.critical(
+                                f"{context_size=} is less than 0, either reduce the max_new_tokens or increase model max length."
+                            )
+                            raise ValueError("Context size is less than 0.")
+                        tokenized = [input[-context_size:] for input in tokenized]
+                else:
+                    if context_size > self.max_length:
+                        logger.warning(
+                            f"{context_size=} which is greater than {self.max_length=}. Truncating context to {self.max_length} tokens."
+                        )
+                        context_size = self.max_length
+                        tokenized = [input[-context_size:] for input in tokenized]
+
+                for position, i in enumerate(text_indices):
+                    inputs[i] = tokenized[position]
 
             vllm_outputs = self._generate(
                 inputs=inputs,
@@ -505,7 +541,12 @@ class VLLMModel(LightevalModel):
         res = []
 
         for split in tqdm(dataset.splits_iterator()):
-            contexts = [self.prompt_manager.prepare_prompt(doc) for doc in split]
+            contexts = [
+                self.prompt_manager.prepare_prompt_multimodal(doc)
+                if doc.images
+                else self.prompt_manager.prepare_prompt(doc)
+                for doc in split
+            ]
 
             inputs = []
             tokenized_continuations_batch = []
@@ -516,7 +557,15 @@ class VLLMModel(LightevalModel):
                     context, doc.choices, pairwise=self.pairwise_tokenization
                 )
                 for tokenized_context, tokenized_continuation in zip(tokenized_contexts, tokenized_continuations):
-                    inputs.append(tokenized_context + tokenized_continuation)
+                    if doc.images:
+                        # Append the continuation as text and let vLLM's HF processor tokenize the
+                        # whole (image + text) prompt. The continuation stays at the very end, so the
+                        # logprob slicing below (which counts back ``len(continuation)`` tokens) still
+                        # lines up regardless of image-token expansion earlier in the prompt.
+                        continuation_text = self.tokenizer.decode(tokenized_continuation)
+                        inputs.append(self._multimodal_prompt(context + continuation_text, doc))
+                    else:
+                        inputs.append(tokenized_context + tokenized_continuation)
                     tokenized_continuations_batch.append(tokenized_continuation)
                     tokenized_contexts_batch.append(tokenized_context)
 
@@ -539,9 +588,17 @@ class VLLMModel(LightevalModel):
                     continuation_len = len(continuation)
                     continuation_start_idx = actual_input_len - continuation_len
                     continuation_prompt_logprobs = output.prompt_logprobs[continuation_start_idx:]
+                    # Use the *actual* prompt token ids at the continuation positions for the
+                    # logprob lookup. In the multimodal path the continuation is appended as text
+                    # and the whole prompt is re-tokenized, so boundary tokens may differ from our
+                    # separately-tokenized ``continuation``. vLLM only includes the top-1 token and
+                    # the actual prompt token in ``prompt_logprobs`` (prompt_logprobs=1), so looking
+                    # up our continuation token directly can raise KeyError. The actual prompt token
+                    # is always present. In the text-only path these tokens equal ``continuation``.
+                    actual_continuation_tokens = output.prompt_token_ids[continuation_start_idx:]
 
                     continuation_logprobs = []
-                    for token, logprobs_at_position in zip(continuation, continuation_prompt_logprobs):
+                    for token, logprobs_at_position in zip(actual_continuation_tokens, continuation_prompt_logprobs):
                         continuation_logprobs.append(logprobs_at_position[token])
 
                     bool_score = all(logprob.rank == 1 for logprob in continuation_logprobs)
@@ -632,12 +689,18 @@ class AsyncVLLMModel(VLLMModel):
         """Contains the actual logic of the generation."""
         sampling_params = SamplingParams(**self.config.generation_parameters.to_vllm_dict())
 
+        base_prompt = (
+            self.prompt_manager.prepare_prompt_multimodal(doc)
+            if doc.images
+            else self.prompt_manager.prepare_prompt(doc)
+        )
+
         if not generative:
             sampling_params.temperature = 0
             sampling_params.prompt_logprobs = 1
             sampling_params.max_tokens = 1
             sampling_params.detokenize = False
-            prompt = self.prompt_manager.prepare_prompt(doc) + doc.choice
+            prompt = base_prompt + doc.choice
             index_str = f"logprob_{index}"
         else:
             sampling_params.n = doc.num_samples
@@ -649,8 +712,13 @@ class AsyncVLLMModel(VLLMModel):
             sampling_params.max_tokens = self.config.generation_parameters.max_new_tokens or doc.generation_size
             sampling_params.stop = [] if self.use_chat_template else doc.stop_sequences
             sampling_params.logprobs = int(doc.use_logits)
-            prompt = self.prompt_manager.prepare_prompt(doc)
+            prompt = base_prompt
             index_str = f"generative_{index}"
+
+        if doc.images:
+            # Attach the images so vLLM's HF processor fuses them with the placeholder
+            # tokens already present in ``base_prompt``.
+            prompt = self._multimodal_prompt(prompt, doc)
 
         generator = self.model.generate(request_id=index_str, prompt=prompt, sampling_params=sampling_params)
         try:

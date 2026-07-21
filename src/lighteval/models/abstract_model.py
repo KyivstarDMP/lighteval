@@ -32,6 +32,7 @@ from transformers.tokenization_utils_base import BatchEncoding, PreTrainedTokeni
 
 from lighteval.models.model_input import GenerationParameters
 from lighteval.models.model_output import ModelResponse
+from lighteval.tasks.prompt_manager import ImagePlacement
 from lighteval.tasks.requests import Doc
 
 
@@ -87,6 +88,7 @@ class ModelConfig(BaseModel, extra="forbid"):
     generation_parameters: GenerationParameters = GenerationParameters()
     system_prompt: str | None = None
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
+    image_placement: ImagePlacement = ImagePlacement.inline
     cache_dir: str = "~/.cache/huggingface/lighteval"
 
     @classmethod

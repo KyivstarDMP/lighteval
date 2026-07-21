@@ -22,6 +22,7 @@
 
 import logging
 import random
+import re
 from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum
@@ -39,6 +40,72 @@ if TYPE_CHECKING:
     from lighteval.tasks.lighteval_task import LightevalTask
 
 
+IMAGE_MARKER_RE = re.compile(r"<image\s*\d*>", re.IGNORECASE)
+
+
+class ImagePlacement(Enum):
+    inline = "inline"
+    prepend = "prepend"
+
+
+ALLOWED_IMAGE_PLACEMENTS = ImagePlacement._member_names_
+
+
+def _normalize_image_placement(placement: "ImagePlacement | str") -> "ImagePlacement":
+    if isinstance(placement, ImagePlacement):
+        return placement
+    if placement not in ALLOWED_IMAGE_PLACEMENTS:
+        raise ValueError(
+            f"image_placement must be one of {','.join(ALLOWED_IMAGE_PLACEMENTS[:-1])} "
+            f"or {ALLOWED_IMAGE_PLACEMENTS[-1]}, not {placement}"
+        )
+    return ImagePlacement[placement]
+
+
+def order_multimodal_content(
+    query: str, image_parts: list[dict], *, placement: "ImagePlacement | str" = ImagePlacement.inline
+) -> list[dict]:
+    """Assemble an ordered chat content list of text + image parts.
+
+    ``placement=ImagePlacement.inline`` (default): images bind to ``<image>`` markers in
+    ``query`` positionally (digits ignored); no marker means the image(s) are prepended.
+
+    ``placement=ImagePlacement.prepend``: markers are ignored entirely -- every image goes
+    before the unmodified query text. Use for chat templates that expect all image tokens
+    up front (e.g. Qwen-VL), where any ``<image N>`` left in the text is just a label.
+    """
+    placement = _normalize_image_placement(placement)
+
+    def text_part(s: str) -> dict:
+        return {"type": "text", "text": s}
+
+    if placement is ImagePlacement.prepend:
+        return image_parts + ([text_part(query)] if query else [])
+
+    n = len(image_parts)
+    # Split on bare "<image>" markers (no capture group): k markers -> k+1 text segments.
+    segments = IMAGE_MARKER_RE.split(query or "")
+
+    if len(segments) == 1:  # no marker -> prepend the image(s) before the text
+        return image_parts + ([text_part(query)] if query else [])
+
+    content: list[dict] = []
+    placed = 0
+    for i, seg in enumerate(segments):
+        if seg:
+            # Keep text verbatim (preserve newlines/spacing); drop only the empty splits the
+            # marker leaves at the very start/end of the query.
+            content.append(text_part(seg))
+        if i < len(segments) - 1:  # a marker separated this segment from the next
+            if placed < n:
+                content.append(image_parts[placed])
+            placed += 1  # advance even past n: a marker with no image renders nothing
+    # More images than markers -> append the remainder IN ORDER, so the textual placeholder
+    # sequence still matches doc.images order (binding is positional; reordering would mis-bind).
+    content.extend(image_parts[placed:])
+    return content
+
+
 class PromptManager:
     def __init__(
         self,
@@ -46,11 +113,13 @@ class PromptManager:
         tokenizer=None,
         system_prompt: str | None = None,
         chat_template_kwargs: dict[str, Any] | None = None,
+        image_placement: "ImagePlacement | str" = ImagePlacement.inline,
     ):
         self.use_chat_template = use_chat_template
         self.tokenizer = tokenizer
         self.system_prompt = system_prompt  # System prompt to be used in chat templates
         self.chat_template_kwargs = chat_template_kwargs or {}
+        self.image_placement = _normalize_image_placement(image_placement)
 
     def prepare_prompt(self, doc: Doc) -> str:
         """Prepare a prompt from a document, either using chat template or plain text format.
@@ -70,9 +139,9 @@ class PromptManager:
         if doc.images is None:
             raise ValueError("Multimodal prompts require images to be provided in the document.")
 
-        text_content = [{"type": "text", "text": doc.query}]
-        image_content = [{"type": "image", "image": image} for image in doc.images]
-        message = {"role": "user", "content": text_content + image_content}
+        image_parts = [{"type": "image", "image": image} for image in doc.images]
+        content = order_multimodal_content(doc.query, image_parts, placement=self.image_placement)
+        message = {"role": "user", "content": content}
 
         if (
             self.system_prompt is not None or doc.instruction is not None

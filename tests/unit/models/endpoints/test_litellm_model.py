@@ -23,9 +23,12 @@
 from unittest.mock import Mock, patch
 
 import pytest
+from PIL import Image
 
 from lighteval.models.endpoints.litellm_model import LiteLLMClient
 from lighteval.models.model_input import GenerationParameters
+from lighteval.tasks.prompt_manager import PromptManager
+from lighteval.tasks.requests import Doc
 from lighteval.utils.imports import is_package_available
 
 
@@ -147,3 +150,104 @@ def test_call_api_openai_reasoning_keeps_max_completion_tokens():
     completion_kwargs = completion.call_args.kwargs
     assert completion_kwargs["max_tokens"] == 640
     assert completion_kwargs["max_completion_tokens"] == 96
+
+
+def _build_client_for_greedy_until(model_name: str) -> LiteLLMClient:
+    """A client wired for the full ``greedy_until`` -> ``litellm.completion`` path.
+
+    On top of ``_build_client`` it sets the two attributes that path touches: a ``prompt_manager``
+    (to build the message structure) and ``concurrent_requests`` (for the request thread pool).
+    """
+    client = _build_client(model_name, GenerationParameters())
+    client.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None, system_prompt=None)
+    client.concurrent_requests = 1
+    client._cache = None
+    return client
+
+
+class TestImagePlacement:
+    """Multimodal ``image_placement`` modes, end to end through ``greedy_until`` -> ``litellm.completion``."""
+
+    def test_greedy_until_sends_image_in_completion_payload(self):
+        client = _build_client_for_greedy_until("openai/gpt-4.1-nano")
+
+        image = Image.new("RGB", (4, 4), (255, 0, 0))
+        doc = Doc(query="What is in this image?", choices=[], gold_index=0, images=[image])
+
+        response = Mock()
+        response.choices = [Mock(message=Mock(content="ok", reasoning_content=None))]
+
+        with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
+            with patch(
+                "lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response
+            ) as completion:
+                client.greedy_until([doc])
+
+        # The image must survive into the messages payload as a base64 PNG data URI.
+        content = completion.call_args.kwargs["messages"][-1]["content"]
+        image_parts = [part for part in content if part.get("type") == "image_url"]
+        assert len(image_parts) == 1
+
+    def test_greedy_until_inline_binds_marker_positionally(self):
+        client = _build_client_for_greedy_until("openai/gpt-4.1-nano")
+        client.prompt_manager = PromptManager(
+            use_chat_template=True,
+            tokenizer=None,
+            system_prompt=None,
+            image_placement="inline",
+        )
+
+        image_1 = Image.new("RGB", (4, 4), (255, 0, 0))
+        image_2 = Image.new("RGB", (4, 4), (0, 255, 0))
+        doc = Doc(
+            query="Compare <image 1> with <image 2> please.",
+            choices=[],
+            gold_index=0,
+            images=[image_1, image_2],
+        )
+
+        response = Mock()
+        response.choices = [Mock(message=Mock(content="ok", reasoning_content=None))]
+
+        with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
+            with patch(
+                "lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response
+            ) as completion:
+                client.greedy_until([doc])
+
+        # Exact text-splitting is covered by test_prompt_manager_class.TestOrderMultimodalContentPlacement;
+        # this only needs to prove image_placement="inline" actually reaches _prepare_multimodal_context.
+        content = completion.call_args.kwargs["messages"][-1]["content"]
+        assert [part["type"] for part in content] == ["text", "image_url", "text", "image_url", "text"]
+
+    def test_greedy_until_prepend_places_all_images_before_unmodified_text(self):
+        client = _build_client_for_greedy_until("openai/gpt-4.1-nano")
+        client.prompt_manager = PromptManager(
+            use_chat_template=True,
+            tokenizer=None,
+            system_prompt=None,
+            image_placement="prepend",
+        )
+
+        image_1 = Image.new("RGB", (4, 4), (255, 0, 0))
+        image_2 = Image.new("RGB", (4, 4), (0, 255, 0))
+        doc = Doc(
+            query="<image 1> Compare with <image 2>.",
+            choices=[],
+            gold_index=0,
+            images=[image_1, image_2],
+        )
+
+        response = Mock()
+        response.choices = [Mock(message=Mock(content="ok", reasoning_content=None))]
+
+        with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
+            with patch(
+                "lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response
+            ) as completion:
+                client.greedy_until([doc])
+
+        # Same rationale as the inline case above: exact text handling is already covered by
+        # TestOrderMultimodalContentPlacement; this proves image_placement="prepend" reaches here.
+        content = completion.call_args.kwargs["messages"][-1]["content"]
+        assert [part["type"] for part in content] == ["image_url", "image_url", "text"]

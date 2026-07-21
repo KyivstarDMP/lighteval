@@ -178,6 +178,7 @@ class VLMTransformersModel(LightevalModel):
             tokenizer=self.tokenizer,
             system_prompt=config.system_prompt,
             chat_template_kwargs=config.chat_template_kwargs,
+            image_placement=config.image_placement,
         )
 
         # Initialize cache for tokenization and predictions
