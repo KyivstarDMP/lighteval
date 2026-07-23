@@ -64,12 +64,12 @@ def test_greedy_until_uses_split_local_contexts():
 
     model = LiteLLMClient.__new__(LiteLLMClient)
     model._cache = None
-    model.generation_parameters = SimpleNamespace(temperature=1)
+    model.generation_parameters = SimpleNamespace(temperature=1, max_new_tokens=None)
     model.prompt_manager = SimpleNamespace(prepare_prompt_api=lambda doc: f"ctx:{doc.query}")
 
     observed_contexts_by_split: list[list[str]] = []
 
-    def fake_call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence):
+    async def fake_call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence):
         observed_contexts_by_split.append(list(contexts))
         return [_mock_response(f"out-{index}") for index, _ in enumerate(contexts)]
 
