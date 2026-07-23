@@ -20,6 +20,7 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import asyncio
 from unittest.mock import Mock, patch
 
 import pytest
@@ -50,6 +51,31 @@ def _build_client(model_name: str, generation_parameters: GenerationParameters) 
     return client
 
 
+def _run_call_api(client: LiteLLMClient, *, supports_reasoning: bool) -> Mock:
+    """Drive ``__call_api`` once against a mocked ``litellm.acompletion``, returning that mock.
+
+    Callers assert on ``.call_args.kwargs`` to check what was sent to the provider.
+    """
+    response = Mock()
+    response.choices = [Mock(message=Mock(content="ok"))]
+
+    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=supports_reasoning):
+        with patch(
+            "lighteval.models.endpoints.litellm_model.litellm.acompletion", return_value=response
+        ) as completion:
+            asyncio.run(
+                client._LiteLLMClient__call_api(
+                    prompt=[{"role": "user", "content": "hello"}],
+                    return_logits=False,
+                    max_new_tokens=64,
+                    num_samples=1,
+                    stop_sequence=None,
+                )
+            )
+
+    return completion
+
+
 @pytest.mark.parametrize(
     "reasoning_effort, supports_reasoning_value, expected_prepared_max_new_tokens",
     [
@@ -70,20 +96,8 @@ def test_prepare_max_new_tokens_boosts_only_with_reasoning_effort(
 
 def test_call_api_o_series_keeps_reasoning_effort_but_drops_sampling_params():
     client = _build_client("openai/o3-mini", GenerationParameters(temperature=0.2, top_p=0.9, reasoning_effort="low"))
-    response = Mock()
-    response.choices = [Mock(message=Mock(content="ok"))]
 
-    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
-        with patch("lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response) as completion:
-            client._LiteLLMClient__call_api(
-                prompt=[{"role": "user", "content": "hello"}],
-                return_logits=False,
-                max_new_tokens=64,
-                num_samples=1,
-                stop_sequence=None,
-            )
-
-    completion_kwargs = completion.call_args.kwargs
+    completion_kwargs = _run_call_api(client, supports_reasoning=False).call_args.kwargs
     assert completion_kwargs["reasoning_effort"] == "low"
     assert "temperature" not in completion_kwargs
     assert "top_p" not in completion_kwargs
@@ -93,20 +107,8 @@ def test_call_api_non_o_series_passes_full_litellm_generation_kwargs():
     client = _build_client(
         "google/gemini-2.5-flash", GenerationParameters(temperature=0.2, top_p=0.9, reasoning_effort="low")
     )
-    response = Mock()
-    response.choices = [Mock(message=Mock(content="ok"))]
 
-    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
-        with patch("lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response) as completion:
-            client._LiteLLMClient__call_api(
-                prompt=[{"role": "user", "content": "hello"}],
-                return_logits=False,
-                max_new_tokens=64,
-                num_samples=1,
-                stop_sequence=None,
-            )
-
-    completion_kwargs = completion.call_args.kwargs
+    completion_kwargs = _run_call_api(client, supports_reasoning=False).call_args.kwargs
     assert completion_kwargs["temperature"] == 0.2
     assert completion_kwargs["top_p"] == 0.9
     assert completion_kwargs["reasoning_effort"] == "low"
@@ -114,49 +116,25 @@ def test_call_api_non_o_series_passes_full_litellm_generation_kwargs():
 
 def test_call_api_openai_non_reasoning_uses_only_max_tokens():
     client = _build_client("openai/gpt-4.1-nano", GenerationParameters(max_new_tokens=96))
-    response = Mock()
-    response.choices = [Mock(message=Mock(content="ok"))]
 
-    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
-        with patch("lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response) as completion:
-            client._LiteLLMClient__call_api(
-                prompt=[{"role": "user", "content": "hello"}],
-                return_logits=False,
-                max_new_tokens=64,
-                num_samples=1,
-                stop_sequence=None,
-            )
-
-    completion_kwargs = completion.call_args.kwargs
+    completion_kwargs = _run_call_api(client, supports_reasoning=False).call_args.kwargs
     assert completion_kwargs["max_tokens"] == 64
     assert "max_completion_tokens" not in completion_kwargs
 
 
 def test_call_api_openai_reasoning_keeps_max_completion_tokens():
     client = _build_client("openai/gpt-5-mini", GenerationParameters(max_new_tokens=96, reasoning_effort="low"))
-    response = Mock()
-    response.choices = [Mock(message=Mock(content="ok"))]
 
-    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=True):
-        with patch("lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response) as completion:
-            client._LiteLLMClient__call_api(
-                prompt=[{"role": "user", "content": "hello"}],
-                return_logits=False,
-                max_new_tokens=64,
-                num_samples=1,
-                stop_sequence=None,
-            )
-
-    completion_kwargs = completion.call_args.kwargs
+    completion_kwargs = _run_call_api(client, supports_reasoning=True).call_args.kwargs
     assert completion_kwargs["max_tokens"] == 640
     assert completion_kwargs["max_completion_tokens"] == 96
 
 
 def _build_client_for_greedy_until(model_name: str) -> LiteLLMClient:
-    """A client wired for the full ``greedy_until`` -> ``litellm.completion`` path.
+    """A client wired for the full ``greedy_until`` -> ``litellm.acompletion`` path.
 
     On top of ``_build_client`` it sets the two attributes that path touches: a ``prompt_manager``
-    (to build the message structure) and ``concurrent_requests`` (for the request thread pool).
+    (to build the message structure) and ``concurrent_requests`` (for the request semaphore).
     """
     client = _build_client(model_name, GenerationParameters())
     client.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None, system_prompt=None)
@@ -165,8 +143,35 @@ def _build_client_for_greedy_until(model_name: str) -> LiteLLMClient:
     return client
 
 
+@pytest.mark.parametrize(
+    ("override_max_new_tokens", "expected_max_new_tokens"),
+    [
+        pytest.param(64, 64, id="override-wins"),
+        pytest.param(None, 8, id="falls-back-to-doc"),
+    ],
+)
+def test_greedy_until_max_new_tokens_precedence(override_max_new_tokens, expected_max_new_tokens):
+    """generation_parameters.max_new_tokens (e.g. a pipeline reasoning override) must take
+    precedence over a task's hardcoded doc.generation_size, mirroring VLLMModel's behavior."""
+    client = _build_client_for_greedy_until("openai/gpt-4.1-nano")
+    client.generation_parameters = GenerationParameters(max_new_tokens=override_max_new_tokens)
+
+    doc = Doc(query="hi", choices=[], gold_index=0, generation_size=8)
+
+    response = Mock()
+    response.choices = [Mock(message=Mock(content="ok", reasoning_content=None))]
+
+    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
+        with patch(
+            "lighteval.models.endpoints.litellm_model.litellm.acompletion", return_value=response
+        ) as completion:
+            client.greedy_until([doc])
+
+    assert completion.call_args.kwargs["max_tokens"] == expected_max_new_tokens
+
+
 class TestImagePlacement:
-    """Multimodal ``image_placement`` modes, end to end through ``greedy_until`` -> ``litellm.completion``."""
+    """Multimodal ``image_placement`` modes, end to end through ``greedy_until`` -> ``litellm.acompletion``."""
 
     def test_greedy_until_sends_image_in_completion_payload(self):
         client = _build_client_for_greedy_until("openai/gpt-4.1-nano")
@@ -179,7 +184,7 @@ class TestImagePlacement:
 
         with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
             with patch(
-                "lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response
+                "lighteval.models.endpoints.litellm_model.litellm.acompletion", return_value=response
             ) as completion:
                 client.greedy_until([doc])
 
@@ -211,7 +216,7 @@ class TestImagePlacement:
 
         with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
             with patch(
-                "lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response
+                "lighteval.models.endpoints.litellm_model.litellm.acompletion", return_value=response
             ) as completion:
                 client.greedy_until([doc])
 
@@ -243,7 +248,7 @@ class TestImagePlacement:
 
         with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
             with patch(
-                "lighteval.models.endpoints.litellm_model.litellm.completion", return_value=response
+                "lighteval.models.endpoints.litellm_model.litellm.acompletion", return_value=response
             ) as completion:
                 client.greedy_until([doc])
 

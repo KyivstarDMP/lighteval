@@ -20,15 +20,16 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import asyncio
 import base64
 import io
 import logging
-import time
-from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
 
 import requests
+from tenacity import AsyncRetrying, RetryCallState, stop_after_attempt
 from tqdm import tqdm
+from tqdm.asyncio import tqdm as async_tqdm
 
 from lighteval.data import GenerativeTaskDataset
 from lighteval.models.abstract_model import LightevalModel, ModelConfig
@@ -171,6 +172,28 @@ class LiteLLMClient(LightevalModel):
         # Initialize cache for tokenization and predictions
         self._cache = SampleCache(config)
 
+        self._log_configuration_warnings()
+
+    def _log_configuration_warnings(self) -> None:
+        """Warn about model/generation-parameter mismatches."""
+        if self._is_o_series_model(self.model):
+            logger.warning("O-series models do not support temperature, top_p, stop sequence. Disabling.")
+
+        if not supports_reasoning(self.model):
+            return
+
+        if self.generation_parameters.reasoning_effort is None:
+            logger.warning(
+                f"Model {self.model} supports reasoning but no reasoning_effort is set. "
+                "Token budget will not be boosted for reasoning. If you want the model to reason, "
+                "set reasoning_effort explicitly (e.g., 'low', 'medium', 'high')."
+            )
+        elif self._should_boost_for_reasoning():
+            logger.warning(
+                "Reasoning model detected, increasing max_new_tokens tenfold (capped at the model's "
+                "max length) to allow for reasoning tokens."
+            )
+
     def _prepare_stop_sequence(self, stop_sequence):
         """Prepare and validate stop sequence."""
         if self.provider == "anthropic":
@@ -208,34 +231,56 @@ class LiteLLMClient(LightevalModel):
         base_model_name = model_name.split("/")[-1].lower()
         return base_model_name.startswith(("o1", "o3", "o4"))
 
+    def _should_boost_for_reasoning(self) -> bool:
+        reasoning_effort = self.generation_parameters.reasoning_effort
+        return isinstance(reasoning_effort, str) and reasoning_effort.strip().lower() != "none"
+
     def _prepare_max_new_tokens(self, max_new_tokens) -> int | None:
         """Calculate completion tokens based on max_new_tokens."""
         if not max_new_tokens or max_new_tokens <= 0:
             return None
 
-        reasoning_effort = self.generation_parameters.reasoning_effort
-        should_boost_for_reasoning = isinstance(reasoning_effort, str) and reasoning_effort.strip().lower() != "none"
-
-        if supports_reasoning(self.model) and reasoning_effort is None:
-            logger.warning(
-                f"Model {self.model} supports reasoning but no reasoning_effort is set. "
-                "Token budget will not be boosted for reasoning. If you want the model to reason, "
-                "set reasoning_effort explicitly (e.g., 'low', 'medium', 'high')."
-            )
-
-        if supports_reasoning(self.model) and should_boost_for_reasoning:
+        if supports_reasoning(self.model) and self._should_boost_for_reasoning():
             # We need to allow more tokens to include reasoning tokens
             max_new_tokens = min(max_new_tokens * 10, self.max_length)
 
-            logger.warning(
-                f"Reasoning model detected, increasing max_new_tokens to {max_new_tokens} to allow for reasoning tokens",
-            )
-
         return max_new_tokens
 
-    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
+    def _tenacity_wait(self, retry_state: RetryCallState) -> float:
+        """Exponential backoff, capped at 64s; honors a server ``Retry-After`` on rate limits."""
+        error = retry_state.outcome.exception() if retry_state.outcome else None
+        if isinstance(error, litellm.RateLimitError):
+            retry_after = self._parse_retry_after(error)
+            if retry_after is not None:
+                return retry_after
+        return min(64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER ** (retry_state.attempt_number - 1)))
+
+    def _log_retry(self, retry_state: RetryCallState) -> None:
+        error = retry_state.outcome.exception() if retry_state.outcome else None
+        wait_time = retry_state.next_action.sleep if retry_state.next_action else 0.0
+        logger.warning(
+            f"API call failed with {type(error).__name__}: {error}. "
+            f"Retrying (attempt {retry_state.attempt_number}/{self.API_MAX_RETRY}) in {wait_time:.1f}s."
+        )
+
+    @staticmethod
+    def _parse_retry_after(error: Exception) -> float | None:
+        headers = getattr(error, "headers", None) or getattr(getattr(error, "response", None), "headers", None) or {}
+        try:
+            return float(headers.get("retry-after") or headers.get("Retry-After"))
+        except (TypeError, ValueError):  # header absent (float(None)) or not a number
+            return None
+
+    def _empty_response_after_retries(self, retry_state: RetryCallState) -> LitellmModelResponse:
+        """Give up once retries are exhausted: log the last error and degrade to an empty response."""
+        logger.error(
+            f"API call failed after {self.API_MAX_RETRY} attempts, "
+            f"last error: {retry_state.outcome.exception()!r}. Returning empty response."
+        )
+        return LitellmModelResponse()
+
+    async def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
         """Make API call with retries."""
-        response = LitellmModelResponse()
         stop_sequence = self._prepare_stop_sequence(stop_sequence)
         max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
 
@@ -261,7 +306,6 @@ class LiteLLMClient(LightevalModel):
         model_supports_reasoning = supports_reasoning(self.model)
         # O-series models reject sampling params (temperature, top_p, stop); only pass reasoning_effort
         if self._is_o_series_model(self.model):
-            logger.warning("O-series models do not support temperature, top_p, stop sequence. Disabling.")
             reasoning_effort = litellm_generation_kwargs.get("reasoning_effort")
             if reasoning_effort is not None:
                 kwargs["reasoning_effort"] = reasoning_effort
@@ -276,19 +320,9 @@ class LiteLLMClient(LightevalModel):
         elif kwargs.get("max_completion_tokens", None) is None:
             kwargs["max_completion_tokens"] = max_new_tokens
 
-        for attempt in range(self.API_MAX_RETRY):
+        async def _do_completion() -> LitellmModelResponse:
             try:
-                response = litellm.completion(**kwargs)
-                content = response.choices[0].message.content
-
-                # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
-                if not content:
-                    logger.info("Response is empty, retrying without caching")
-                    kwargs["caching"] = False
-                    response = litellm.completion(**kwargs)
-                    content = response.choices[0].message.content
-
-                return response
+                response = await litellm.acompletion(**kwargs)
             except litellm.BadRequestError as e:
                 if "message" in e.__dict__:
                     error_string = (
@@ -297,19 +331,24 @@ class LiteLLMClient(LightevalModel):
                     if error_string in e.__dict__["message"]:
                         logger.warning(f"{error_string}. Returning empty response.")
                         return LitellmModelResponse()
-            except Exception as e:
-                wait_time = min(
-                    64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
-                )  # Exponential backoff with max 64s
-                logger.warning(
-                    f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
-                )
-                time.sleep(wait_time)
+                raise
 
-        logger.error(f"API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
-        return LitellmModelResponse()
+            # If response is empty, retry once without caching (maybe the error is recoverable and solved with a retry)
+            if not response.choices[0].message.content:
+                logger.info("Response is empty, retrying without caching")
+                kwargs["caching"] = False
+                response = await litellm.acompletion(**kwargs)
 
-    def __call_api_parallel(
+            return response
+
+        return await AsyncRetrying(
+            stop=stop_after_attempt(self.API_MAX_RETRY),
+            wait=self._tenacity_wait,
+            before_sleep=self._log_retry,
+            retry_error_callback=self._empty_response_after_retries,
+        )(_do_completion)
+
+    async def __call_api_parallel(
         self,
         prompts,
         return_logits: bool | list[bool],
@@ -317,8 +356,6 @@ class LiteLLMClient(LightevalModel):
         num_samples: int | list[int],
         stop_sequence: list[str] | None = None,
     ):
-        results = []
-
         return_logitss = [return_logits for _ in prompts] if not isinstance(return_logits, list) else return_logits
         max_new_tokenss = [max_new_tokens for _ in prompts] if not isinstance(max_new_tokens, list) else max_new_tokens
         num_sampless = [num_samples for _ in prompts] if not isinstance(num_samples, list) else num_samples
@@ -329,19 +366,17 @@ class LiteLLMClient(LightevalModel):
             f"Length of prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequences, system_prompts should be the same but are {len(prompts)}, {len(return_logitss)}, {len(max_new_tokenss)}, {len(num_sampless)}, {len(stop_sequencess)}"
         )
 
-        with ThreadPoolExecutor(self.concurrent_requests) as executor:
-            for entry in tqdm(
-                executor.map(
-                    self.__call_api,
-                    prompts,
-                    return_logitss,
-                    max_new_tokenss,
-                    num_sampless,
-                    stop_sequencess,
-                ),
-                total=len(prompts),
-            ):
-                results.append(entry)
+        semaphore = asyncio.Semaphore(self.concurrent_requests)
+
+        async def bounded_call(prompt, return_logits, max_new_tokens, num_samples, stop_sequence):
+            async with semaphore:
+                return await self.__call_api(prompt, return_logits, max_new_tokens, num_samples, stop_sequence)
+
+        tasks = [
+            bounded_call(prompt, rl, mnt, ns, ss)
+            for prompt, rl, mnt, ns, ss in zip(prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequencess)
+        ]
+        results = await async_tqdm.gather(*tasks, disable=self.disable_tqdm)
 
         if None in results:
             raise ValueError("Some entries are not annotated due to errors in annotate_p, please inspect and retry.")
@@ -394,47 +429,57 @@ class LiteLLMClient(LightevalModel):
             list[ModelResponse]: list of generated responses.
         """
         dataset = GenerativeTaskDataset(requests=docs, num_dataset_splits=self.DATASET_SPLITS)
-        results = []
 
-        for split in tqdm(
-            dataset.splits_iterator(),
-            total=dataset.num_dataset_splits,
-            desc="Splits",
-            position=0,
-            disable=self.disable_tqdm,
-        ):
-            # Use split-local docs to avoid issuing full-dataset requests for every split.
-            contexts = [
-                self._prepare_multimodal_context(doc) if doc.images else self.prompt_manager.prepare_prompt_api(doc)
-                for doc in split
-            ]
-            max_new_tokens = split[0].generation_size  # could be none
-            return_logits = split[0].use_logits
-            num_samples = split[0].num_samples
-            stop_sequence = split[0].stop_sequences
+        async def process_splits() -> list[ModelResponse]:
+            results = []
 
-            if num_samples > 1 and self.generation_parameters.temperature == 0:
-                raise ValueError(
-                    "num_samples > 1 is not supported with temperature=0, please set temperature > 0 or use non sampling metrics."
-                )
-
-            responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence)
-
-            for response, context in zip(responses, contexts):
-                result: list[str] = [choice.message.content for choice in response.choices]
-                reasonings: list[str | None] = [
-                    getattr(choice.message, "reasoning_content", None) for choice in response.choices
+            for split in tqdm(
+                dataset.splits_iterator(),
+                total=dataset.num_dataset_splits,
+                desc="Splits",
+                position=0,
+                disable=self.disable_tqdm,
+            ):
+                # Use split-local docs to avoid issuing full-dataset requests for every split.
+                contexts = [
+                    self._prepare_multimodal_context(doc)
+                    if doc.images
+                    else self.prompt_manager.prepare_prompt_api(doc)
+                    for doc in split
                 ]
+                max_new_tokens = self.generation_parameters.max_new_tokens or split[0].generation_size
+                return_logits = split[0].use_logits
+                num_samples = split[0].num_samples
+                stop_sequence = split[0].stop_sequences
 
-                cur_response = ModelResponse(
-                    # In empty responses, the model should return an empty string instead of None
-                    text=result if result[0] else [""],
-                    reasonings=reasonings,
-                    input=context,
+                if num_samples > 1 and self.generation_parameters.temperature == 0:
+                    raise ValueError(
+                        "num_samples > 1 is not supported with temperature=0, please set temperature > 0 or use non sampling metrics."
+                    )
+
+                responses = await self.__call_api_parallel(
+                    contexts, return_logits, max_new_tokens, num_samples, stop_sequence
                 )
-                results.append(cur_response)
 
-        return dataset.get_original_order(results)
+                for response, context in zip(responses, contexts):
+                    result: list[str] = [choice.message.content for choice in response.choices]
+                    reasonings: list[str | None] = [
+                        getattr(choice.message, "reasoning_content", None) for choice in response.choices
+                    ]
+
+                    cur_response = ModelResponse(
+                        # In empty responses, the model should return an empty string instead of None
+                        text=result if result[0] else [""],
+                        reasonings=reasonings,
+                        input=context,
+                    )
+                    results.append(cur_response)
+
+            return results
+
+        # One event loop for all splits: litellm keys its cached HTTP clients on the running loop's
+        # id, so a loop per split would throw away the connection pool each time.
+        return dataset.get_original_order(asyncio.run(process_splits()))
 
     @property
     def tokenizer(self):
