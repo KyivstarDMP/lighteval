@@ -221,9 +221,8 @@ def test_tenacity_wait_honors_retry_after_header_over_backoff():
     client.API_RETRY_SLEEP = 1.0
     client.API_RETRY_MULTIPLIER = 2.0
 
-    error = litellm.RateLimitError(
-        message="rate limited", llm_provider="openai", model="gpt-4.1-nano", headers={"retry-after": "67"}
-    )
+    error = litellm.RateLimitError(message="rate limited", llm_provider="openai", model="gpt-4.1-nano")
+    error.headers = {"retry-after": "67"}
     retry_state = SimpleNamespace(outcome=SimpleNamespace(exception=lambda: error), attempt_number=5)
 
     # Server-specified Retry-After (67s) wins over what backoff would otherwise compute
