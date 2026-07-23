@@ -143,6 +143,33 @@ def _build_client_for_greedy_until(model_name: str) -> LiteLLMClient:
     return client
 
 
+@pytest.mark.parametrize(
+    ("override_max_new_tokens", "expected_max_new_tokens"),
+    [
+        pytest.param(64, 64, id="override-wins"),
+        pytest.param(None, 8, id="falls-back-to-doc"),
+    ],
+)
+def test_greedy_until_max_new_tokens_precedence(override_max_new_tokens, expected_max_new_tokens):
+    """generation_parameters.max_new_tokens (e.g. a pipeline reasoning override) must take
+    precedence over a task's hardcoded doc.generation_size, mirroring VLLMModel's behavior."""
+    client = _build_client_for_greedy_until("openai/gpt-4.1-nano")
+    client.generation_parameters = GenerationParameters(max_new_tokens=override_max_new_tokens)
+
+    doc = Doc(query="hi", choices=[], gold_index=0, generation_size=8)
+
+    response = Mock()
+    response.choices = [Mock(message=Mock(content="ok", reasoning_content=None))]
+
+    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
+        with patch(
+            "lighteval.models.endpoints.litellm_model.litellm.acompletion", return_value=response
+        ) as completion:
+            client.greedy_until([doc])
+
+    assert completion.call_args.kwargs["max_tokens"] == expected_max_new_tokens
+
+
 class TestImagePlacement:
     """Multimodal ``image_placement`` modes, end to end through ``greedy_until`` -> ``litellm.acompletion``."""
 
