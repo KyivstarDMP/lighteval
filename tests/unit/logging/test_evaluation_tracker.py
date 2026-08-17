@@ -156,6 +156,52 @@ class TestLogging:
         details_dir = Path(mock_evaluation_tracker.output_dir) / "details" / "test_model"
         assert not details_dir.exists()
 
+    @staticmethod
+    def _log_multimodal_detail(tracker: EvaluationTracker):
+        from PIL import Image
+
+        from lighteval.models.model_output import ModelResponse
+        from lighteval.tasks.requests import Doc
+
+        doc = Doc(
+            task_name="task1",
+            query="What is shown?",
+            choices=["A", "B"],
+            gold_index=0,
+            images=[Image.new("RGB", (32, 16)), Image.new("L", (8, 8))],
+        )
+        response = ModelResponse(text=["A"], input="What is shown?")
+        tracker.details_logger.log("task1", doc, response, {"acc": 1.0})
+        return doc
+
+    @pytest.mark.evaluation_tracker(save_details=True)
+    def test_details_images_replaced_with_placeholders(self, mock_evaluation_tracker, mock_datetime):
+        doc = self._log_multimodal_detail(mock_evaluation_tracker)
+
+        mock_evaluation_tracker.save()
+
+        date_id = mock_datetime.isoformat().replace(":", "-")
+        details_dir = Path(mock_evaluation_tracker.output_dir) / "details" / "test_model" / date_id
+        dataset = Dataset.from_parquet(str(details_dir / f"details_task1_{date_id}.parquet"))
+        assert dataset[0]["doc"]["images"] == ["<image 32x16 RGB>", "<image 8x8 L>"]
+        assert dataset[0]["metric"] == {"acc": 1.0}
+        # The logged Doc itself must not be mutated: its images stay usable PIL objects.
+        assert doc.images[0].size == (32, 16)
+
+    @pytest.mark.evaluation_tracker(save_details=True)
+    def test_details_images_kept_with_env_var(self, mock_evaluation_tracker, mock_datetime, monkeypatch):
+        monkeypatch.setenv("LIGHTEVAL_DETAILS_KEEP_IMAGES", "1")
+        self._log_multimodal_detail(mock_evaluation_tracker)
+
+        mock_evaluation_tracker.save()
+
+        date_id = mock_datetime.isoformat().replace(":", "-")
+        details_dir = Path(mock_evaluation_tracker.output_dir) / "details" / "test_model" / date_id
+        dataset = Dataset.from_parquet(str(details_dir / f"details_task1_{date_id}.parquet"))
+        images = dataset[0]["doc"]["images"]
+        assert len(images) == 2
+        assert not isinstance(images[0], str)
+
     @pytest.mark.skip(  # skipif
         reason="Secrets are not available in this environment",
         # condition=os.getenv("HF_TEST_TOKEN") is None,

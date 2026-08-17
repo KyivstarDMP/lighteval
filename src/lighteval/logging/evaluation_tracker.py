@@ -25,7 +25,8 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, is_dataclass
+from collections.abc import Iterable
+from dataclasses import asdict, fields, is_dataclass
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
@@ -56,6 +57,35 @@ try:
     from fsspec import url_to_fs
 except ImportError:
     from fsspec.core import url_to_fs
+
+
+def _to_dict_without_copy(obj):
+    """`dataclasses.asdict`, minus the `copy.deepcopy` of every leaf value.
+
+    `asdict` deep-copies each non-dataclass value it encounters; for multimodal docs that
+    duplicates every decoded PIL image in memory. Containers are rebuilt, so the returned
+    structure can be modified safely, but the leaves are shared with the original objects
+    and must not be mutated.
+    """
+    if is_dataclass(obj) and not isinstance(obj, type):
+        return {f.name: _to_dict_without_copy(getattr(obj, f.name)) for f in fields(obj)}
+    if isinstance(obj, tuple) and hasattr(obj, "_fields"):  # namedtuple
+        return type(obj)(*[_to_dict_without_copy(value) for value in obj])
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_dict_without_copy(value) for value in obj)
+    if isinstance(obj, dict):
+        return {key: _to_dict_without_copy(value) for key, value in obj.items()}
+    return obj
+
+
+def _image_placeholder(image) -> str:
+    """Compact text stand-in for an image embedded in a doc (the image itself stays re-fetchable from the source dataset)."""
+    width = getattr(image, "width", None)
+    height = getattr(image, "height", None)
+    mode = getattr(image, "mode", None)
+    if width and height:
+        return f"<image {width}x{height} {mode}>" if mode else f"<image {width}x{height}>"
+    return "<image>"
 
 
 class EnhancedJSONEncoder(json.JSONEncoder):
@@ -251,26 +281,32 @@ class EvaluationTracker:
 
         results_dict = self.results
 
-        # Create the details datasets for later upload
-        details_datasets: dict[str, Dataset] = {}
-        for task_name, task_details in self.details_logger.details.items():
-            # Create a dataset from the dictionary - we force cast to str to avoid formatting problems for nested objects
-            dataset = Dataset.from_list([asdict(detail) for detail in task_details])
-
-            # We don't keep 'id' around if it's there
-            column_names = dataset.column_names
-            if "id" in dataset.column_names:
-                column_names = [t for t in dataset.column_names if t != "id"]
-
-            # Sort column names to make it easier later
-            dataset = dataset.select_columns(sorted(column_names))
-            details_datasets[task_name] = dataset
-
         # We save results at every case
         self.save_results(date_id, results_dict)
 
+        # Only materialize every details dataset at once when a consumer needs them all
+        # together; plain details saving instead streams one task at a time (see below).
+        needs_all_details_in_memory = self.should_push_to_hub or self.use_wandb is True
+        details_datasets: dict[str, Dataset] = {}
+        if needs_all_details_in_memory:
+            details_datasets = {
+                task_name: self._build_details_dataset(task_details)
+                for task_name, task_details in self.details_logger.details.items()
+            }
+
         if self.should_save_details:
-            self.save_details(date_id, details_datasets)
+            if needs_all_details_in_memory:
+                self.save_details(date_id, details_datasets)
+            else:
+                # Build -> write -> free one task at a time: peak memory stays at a single
+                # task's details instead of every task's at once.
+                self.save_details(
+                    date_id,
+                    (
+                        (task_name, self._build_details_dataset(task_details))
+                        for task_name, task_details in self.details_logger.details.items()
+                    ),
+                )
 
         if self.should_push_to_hub:
             self.push_to_hub(
@@ -351,11 +387,39 @@ class EvaluationTracker:
                 )
         return details_datasets
 
-    def save_details(self, date_id: str, details_datasets: dict[str, Dataset]):
+    def _build_details_dataset(self, task_details: list) -> Dataset:
+        """Converts one task's logged details into a `Dataset`.
+
+        By default any images embedded in the docs are replaced with small text placeholders:
+        they are unmodified copies of the source dataset rows, and both deep-copying and
+        re-encoding them dominated save time for multimodal tasks. Set
+        `LIGHTEVAL_DETAILS_KEEP_IMAGES=1` to embed the actual images instead.
+        """
+        keep_images = os.environ.get("LIGHTEVAL_DETAILS_KEEP_IMAGES", "").lower() in ("1", "true", "yes")
+        rows = []
+        for detail in task_details:
+            row = _to_dict_without_copy(detail)
+            doc = row.get("doc") if isinstance(row, dict) else None
+            if not keep_images and isinstance(doc, dict) and doc.get("images"):
+                doc["images"] = [_image_placeholder(image) for image in doc["images"]]
+            rows.append(row)
+        dataset = Dataset.from_list(rows)
+
+        # We don't keep 'id' around if it's there
+        column_names = dataset.column_names
+        if "id" in dataset.column_names:
+            column_names = [t for t in dataset.column_names if t != "id"]
+
+        # Sort column names to make it easier later
+        return dataset.select_columns(sorted(column_names))
+
+    def save_details(self, date_id: str, details_datasets: dict[str, Dataset] | Iterable[tuple[str, Dataset]]):
         output_dir_details_sub_folder = self._get_details_sub_folder(date_id)
         self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
         logger.info(f"Saving details to {output_dir_details_sub_folder}")
-        for task_name, dataset in details_datasets.items():
+        if isinstance(details_datasets, dict):
+            details_datasets = details_datasets.items()
+        for task_name, dataset in details_datasets:
             output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
             with self.fs.open(str(output_file_details), "wb") as f:
                 dataset.to_parquet(f)
