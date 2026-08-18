@@ -25,7 +25,8 @@ import gc
 import itertools
 import logging
 import os
-from typing import Coroutine, Optional
+from dataclasses import dataclass
+from typing import Callable, Coroutine, Optional
 
 import torch
 from pydantic import NonNegativeFloat, NonNegativeInt, PositiveInt
@@ -55,6 +56,240 @@ def build_vllm_token_prompts(inputs: list) -> list:
     from vllm.inputs import TokensPrompt
 
     return [item if isinstance(item, dict) else TokensPrompt(prompt_token_ids=item) for item in inputs]
+
+
+@dataclass
+class LoglikelihoodOutput:
+    """Engine-agnostic view of one scored log-likelihood request.
+
+    ``prompt_logprobs`` mirrors vLLM's ``RequestOutput.prompt_logprobs`` (one ``{token_id: Logprob}``
+    dict per prompt position, ``None`` at position 0). Only the continuation positions are guaranteed
+    to hold valid values: when prefix-cache reading is on, positions of the context that were served
+    from the KV cache are never read and are left as vLLM returned them.
+    """
+
+    prompt_token_ids: list[int]
+    prompt_logprobs: list
+
+
+def _common_prefix_len(a: list[int], b: list[int]) -> int:
+    """Length of the longest common prefix of two token-id lists."""
+    for i, (x, y) in enumerate(zip(a, b)):
+        if x != y:
+            return i
+    return min(len(a), len(b))
+
+
+def _has_real_logprob(entry, token) -> bool:
+    """True iff ``entry`` (a per-position ``{token_id: Logprob}`` dict) holds a numeric logprob for ``token``.
+
+    Presence alone is not enough: vLLM can emit a ``Logprob`` whose ``.logprob`` is ``None`` at
+    positions it did not really compute (seen on gemma-3n at the cache boundary), and lighteval's
+    own ``prompt_logprobs`` uses ``None`` for position 0. Such an entry must count as missing so the
+    request is re-issued on the safe path instead of feeding ``None`` into ``sum``/``argmax``.
+    """
+    if entry is None or token not in entry:
+        return False
+    logprob = getattr(entry[token], "logprob", entry[token])
+    return isinstance(logprob, (int, float)) and logprob == logprob  # not None, not NaN
+
+
+def _valid_prompt_logprob_positions(output) -> range | None:
+    """Positions of ``output.prompt_logprobs`` that vLLM actually computed for this request.
+
+    vLLM fills prompt logprobs only for the tokens it forwards: for a request whose first
+    ``num_cached_tokens`` tokens were served from the prefix KV cache, the logprob buffer rows for
+    prompt positions ``1 .. num_cached_tokens`` (inclusive: the row for position ``p`` is produced by
+    forwarding token ``p - 1``, and token ``num_cached_tokens - 1`` is the last cached one) are left
+    uninitialised. Position ``0`` never has a logprob. Returns ``None`` when the output cannot be
+    trusted at all (missing / inconsistent metadata).
+    """
+    ids = output.prompt_token_ids
+    logprobs = output.prompt_logprobs
+    cached = getattr(output, "num_cached_tokens", None)
+    if ids is None or logprobs is None or cached is None or len(logprobs) != len(ids):
+        return None
+    return range(max(int(cached), 0) + 1, len(ids))
+
+
+def _find_sibling_logprobs(
+    local: int, pos: int, doc_ids: list[list[int]], doc_valid: list[range | None], doc_outputs: list
+) -> dict | None:
+    """Logprob dict of a sibling option that forwarded ``pos`` of a prefix identical to request ``local``.
+
+    ``doc_ids[local][: pos + 1] == doc_ids[other][: pos + 1]`` means the same token in the same context
+    (and, within one document, the same images), hence the same conditional logprob at ``pos``.
+    """
+    ids = doc_ids[local]
+    token = ids[pos]
+    for other, other_output in enumerate(doc_outputs):
+        if other == local:
+            continue
+        other_valid = doc_valid[other]
+        other_ids = doc_ids[other]
+        if other_valid is None or pos not in other_valid or len(other_ids) <= pos:
+            continue
+        if _common_prefix_len(ids, other_ids) <= pos:
+            continue
+        entry = other_output.prompt_logprobs[pos]
+        if _has_real_logprob(entry, token):
+            return entry
+    return None
+
+
+def _resolve_request_prompt_logprobs(
+    local: int, doc_outputs: list, doc_ids: list, doc_valid: list, continuation_len: int
+) -> tuple[list | None, int]:
+    """Per-request part of :func:`_resolve_prefix_cached_prompt_logprobs`.
+
+    Returns ``(repaired_prompt_logprobs, recovered_positions)``; ``repaired_prompt_logprobs`` is
+    ``None`` when the request must be re-issued.
+    """
+    valid = doc_valid[local]
+    if valid is None:
+        return None, 0
+    output = doc_outputs[local]
+    ids = doc_ids[local]
+    own = output.prompt_logprobs
+    repaired = own
+    recovered = 0
+    for pos in range(max(len(ids) - continuation_len, 0), len(ids)):
+        if pos in valid:
+            if not _has_real_logprob(own[pos], ids[pos]):
+                return None, 0
+            continue
+        donor = _find_sibling_logprobs(local, pos, doc_ids, doc_valid, doc_outputs)
+        if donor is None:
+            return None, 0
+        if repaired is own:
+            repaired = list(own)  # shallow copy on first repair: never mutate vLLM's object
+        repaired[pos] = donor
+        recovered += 1
+    return repaired, recovered
+
+
+def _resolve_prefix_cached_prompt_logprobs(
+    outputs: list,
+    doc_slices: list[tuple[int, int]],
+    continuation_lens: list[int],
+) -> tuple[list[list | None], dict]:
+    """Validate (and, where possible, repair) prompt logprobs of cache-reading log-likelihood requests.
+
+    Args:
+        outputs: one vLLM ``RequestOutput``-like object per request (``prompt_token_ids``,
+            ``prompt_logprobs``, ``num_cached_tokens``), in request order.
+        doc_slices: ``(start, end)`` request-index ranges, one per document; the requests of a slice
+            are the option requests (siblings) of that document and share its context and images.
+        continuation_lens: number of continuation tokens (scored positions at the very end of the
+            prompt) for each request.
+
+    Returns:
+        ``(resolved, stats)``. ``resolved[i]`` is a per-position list (same length as the request's
+        prompt) whose continuation positions hold the ``{token_id: Logprob}`` dict to score from —
+        either the request's own dict (position was forwarded) or a sibling's dict at the same
+        absolute position (position lies in the prefix shared with that sibling *and* the sibling
+        forwarded it: same tokens up to and including that position, same context and images, hence
+        the same conditional logprob). ``resolved[i]`` is ``None`` when at least one continuation
+        position can be neither trusted nor recovered — the caller must re-issue that request with
+        prefix-cache reading disabled. Nothing is ever guessed: any position whose dict does not
+        contain the actual prompt token is treated as unrecoverable.
+    """
+    resolved: list[list | None] = [None] * len(outputs)
+    stats = {
+        "recovered_positions": 0,
+        "recovered_requests": 0,
+        "recovered_docs": 0,
+        "reissued_requests": 0,
+        "reissued_docs": 0,
+        "prompt_tokens": 0,
+        "cached_tokens": 0,
+    }
+
+    for start, end in doc_slices:
+        doc_outputs = outputs[start:end]
+        doc_ids = [o.prompt_token_ids for o in doc_outputs]
+        doc_valid = [_valid_prompt_logprob_positions(o) for o in doc_outputs]
+        doc_recovered = doc_reissued = False
+
+        for local, output in enumerate(doc_outputs):
+            if doc_ids[local] is not None:
+                stats["prompt_tokens"] += len(doc_ids[local])
+                stats["cached_tokens"] += max(int(getattr(output, "num_cached_tokens", 0) or 0), 0)
+            repaired, recovered = _resolve_request_prompt_logprobs(
+                local, doc_outputs, doc_ids, doc_valid, continuation_lens[start + local]
+            )
+            if repaired is None:
+                doc_reissued = True
+                stats["reissued_requests"] += 1
+                continue
+            resolved[start + local] = repaired
+            stats["recovered_positions"] += recovered
+            if recovered:
+                doc_recovered = True
+                stats["recovered_requests"] += 1
+
+        stats["recovered_docs"] += int(doc_recovered)
+        stats["reissued_docs"] += int(doc_reissued)
+
+    return resolved, stats
+
+
+def _score_loglikelihood_requests(
+    generate: Callable[[list, bool], list],
+    inputs: list,
+    doc_slices: list[tuple[int, int]],
+    continuation_lens: list[int],
+    count_preemptions: Callable[[], int | None] | None = None,
+) -> tuple[list[LoglikelihoodOutput], dict]:
+    """Score log-likelihood requests with prefix-cache reading, falling back per request where needed.
+
+    ``generate(inputs, read_prefix_cache)`` must run the given prompts through the engine and return
+    one ``RequestOutput``-like object per prompt. All requests are first sent in one call with cache
+    reading enabled; the outputs are validated with :func:`_resolve_prefix_cached_prompt_logprobs` and
+    the requests that could not be resolved are re-issued in a second, small call with cache reading
+    disabled (the pre-existing behaviour, always valid). If ``count_preemptions`` reports that the
+    engine preempted requests during the first pass — after a preemption vLLM re-schedules a request
+    with a fresh cache lookup but keeps its original ``num_cached_tokens``, so the metadata can no
+    longer be trusted — or if it cannot report at all, every request is re-issued on the safe path.
+    """
+    stats: dict = {"requests": len(inputs), "docs": len(doc_slices), "preemptions": 0, "fallback": None}
+    if not inputs:
+        return [], stats
+
+    before = count_preemptions() if count_preemptions is not None else None
+    outputs = generate(inputs, True)
+    after = count_preemptions() if count_preemptions is not None else None
+
+    resolved, resolve_stats = _resolve_prefix_cached_prompt_logprobs(outputs, doc_slices, continuation_lens)
+    stats.update(resolve_stats)
+    if before is None or after is None:
+        stats["fallback"] = "preemption counter unavailable"
+    elif after != before:
+        stats["preemptions"] = after - before
+        stats["fallback"] = f"{after - before} preemption(s) during the cache-reading pass"
+    if stats["fallback"] is not None:
+        # The validity metadata cannot be trusted: keep the token accounting, discard everything else.
+        resolved = [None] * len(inputs)
+        stats.update(
+            recovered_positions=0,
+            recovered_requests=0,
+            recovered_docs=0,
+            reissued_requests=len(inputs),
+            reissued_docs=len(doc_slices),
+        )
+
+    results: list[LoglikelihoodOutput | None] = [
+        None if logprobs is None else LoglikelihoodOutput(output.prompt_token_ids, logprobs)
+        for output, logprobs in zip(outputs, resolved)
+    ]
+
+    reissue = [i for i, item in enumerate(results) if item is None]
+    if reissue:
+        safe_outputs = generate([inputs[i] for i in reissue], False)
+        for i, output in zip(reissue, safe_outputs):
+            results[i] = LoglikelihoodOutput(output.prompt_token_ids, output.prompt_logprobs)
+
+    return results, stats
 
 
 if is_package_available("vllm"):
@@ -156,6 +391,36 @@ class VLLMModelConfig(ModelConfig):
         system_prompt (str | None, optional, defaults to None): Optional system prompt to be used with chat models.
             This prompt sets the behavior and context for the model during evaluation.
         cache_dir (str, optional, defaults to "~/.cache/huggingface/lighteval"): Directory to cache the model.
+        skip_mm_profiling (bool):
+            Fork-specific. Forwarded to vLLM's ``skip_mm_profiling`` engine arg (skips the multimodal
+            memory-profiling pass at start-up). Defaults to False.
+        attention_backend (str | None):
+            Fork-specific. Forwarded to vLLM's ``attention_backend`` engine arg. Defaults to None (vLLM picks).
+        mm_encoder_attn_backend (str | None):
+            Fork-specific. Forwarded to vLLM's ``mm_encoder_attn_backend`` engine arg (attention backend of
+            the vision encoder). Defaults to None (vLLM picks).
+        loglikelihood_prefix_cache (bool):
+            Fork-specific. Let the log-likelihood (MCQ) requests *read* vLLM's prefix KV cache, so the option
+            requests of one document reuse the KV of their shared context instead of re-encoding it once per
+            option. vLLM computes prompt logprobs only for the positions it actually forwards (the first
+            ``num_cached_tokens + 1`` positions of a cache-hitting request carry uninitialised values), so the
+            model validates every continuation position, fills invalid positions that lie in the prefix shared
+            with a sibling option from that sibling's computed value (same tokens, same context, same images
+            => same conditional logprob), and re-issues any option whose option-specific positions were not
+            computed with cache reading disabled. vLLM stat logging is enabled so that preemptions (which
+            invalidate ``num_cached_tokens``) can be detected; a batch that saw a preemption is re-scored on
+            the safe path. Results are therefore identical to the one-request-per-option path up to the usual
+            bf16 batch-composition noise. Defaults to True; set to False to restore the previous behaviour.
+            Ignored by ``AsyncVLLMModel``.
+        loglikelihood_multimodal_token_prompts (bool):
+            Fork-specific. Send the log-likelihood requests of image documents as token ids (tokenized
+            context + continuation) plus the images, instead of a text prompt that vLLM re-tokenizes. The
+            text prompt has two defects: the context's trailing whitespace is scored twice (``tok_encode_pair``
+            moves it into the continuation, but the original context string is still used, so e.g.
+            ``...<start_of_turn>model\n`` + ``\n A`` is scored), and models whose tokenizer prepends BOS to
+            plain text (gemma-3) get a second BOS from vLLM's tokenizer. Fixing them changes the scored prompt
+            and therefore the numbers of image tasks (measurably, including argmax flips), so this defaults to
+            False to keep existing results comparable; switch it on deliberately together with a re-run.
 
     Example:
         ```python
@@ -202,6 +467,8 @@ class VLLMModelConfig(ModelConfig):
     skip_mm_profiling: bool = False
     attention_backend: str | None = None
     mm_encoder_attn_backend: str | None = None
+    loglikelihood_prefix_cache: bool = True
+    loglikelihood_multimodal_token_prompts: bool = False
 
 
 @requires("vllm")
@@ -293,6 +560,9 @@ class VLLMModel(LightevalModel):
             "max_num_batched_tokens": int(config.max_num_batched_tokens),
             "enforce_eager": True,
             "skip_mm_profiling": config.skip_mm_profiling,
+            # The loglikelihood prefix-cache path reads vLLM's preemption counter (``LLM.get_metrics``),
+            # which is only maintained while stat logging is on.
+            "disable_log_stats": not config.loglikelihood_prefix_cache,
         }
 
         if config.quantization is not None:
@@ -363,6 +633,17 @@ class VLLMModel(LightevalModel):
         images supplied in ``multi_modal_data``.
         """
         return {"prompt": prompt, "multi_modal_data": {"image": list(doc.images)}}
+
+    @staticmethod
+    def _multimodal_token_prompt(token_ids: list[int], doc: Doc) -> dict:
+        """Build a vLLM multimodal prompt from already-tokenized text plus the document's images.
+
+        The token ids carry one placeholder token per image (from tokenizing the chat-template text);
+        vLLM's HF processor expands each placeholder into the model's image-token sequence and fuses
+        the images supplied in ``multi_modal_data``. Unlike a string prompt, no BOS is added by vLLM's
+        tokenization and the continuation tokens stay exactly the ones we tokenized.
+        """
+        return {"prompt_token_ids": list(token_ids), "multi_modal_data": {"image": list(doc.images)}}
 
     def _greedy_until(
         self,
@@ -529,6 +810,151 @@ class VLLMModel(LightevalModel):
 
         return outputs
 
+    @staticmethod
+    def _loglikelihood_sampling_params(read_prefix_cache: bool) -> SamplingParams:
+        """Greedy, prompt-logprob-only sampling params for log-likelihood scoring.
+
+        vLLM defaults ``skip_reading_prefix_cache`` to True whenever prompt logprobs are requested
+        (cached positions would carry no logprob); the prefix-cache path opts back in explicitly and
+        deals with the partially-filled logprobs itself.
+        """
+        params = {"temperature": 0.0, "prompt_logprobs": 1, "max_tokens": 1, "detokenize": False}
+        if read_prefix_cache:
+            try:
+                return SamplingParams(**params, skip_reading_prefix_cache=False)
+            except TypeError:  # vLLM without the knob: nothing is ever read, every position is computed
+                logger.warning(
+                    "This vLLM has no `SamplingParams.skip_reading_prefix_cache`; loglikelihood requests run "
+                    "without prefix-cache reuse."
+                )
+        return SamplingParams(**params)
+
+    @staticmethod
+    def _count_preemptions(llm) -> int | None:
+        """Cumulative number of scheduler preemptions, or ``None`` when the engine cannot report it."""
+        try:
+            metrics = llm.get_metrics()
+        except Exception:  # stat logging disabled / older vLLM without ``get_metrics``
+            return None
+        total, found = 0, False
+        for metric in metrics:
+            if getattr(metric, "name", None) == "vllm:num_preemptions" and hasattr(metric, "value"):
+                total += int(metric.value)
+                found = True
+        return total if found else None
+
+    @classmethod
+    def _score_loglikelihood_on_engine(
+        cls, llm, inputs: list, doc_slices: list[tuple[int, int]], continuation_lens: list[int]
+    ) -> tuple[list[LoglikelihoodOutput], dict]:
+        """Run the prefix-cache log-likelihood scoring against one (local or ray-worker) ``LLM``."""
+
+        def generate(requests: list, read_prefix_cache: bool) -> list:
+            return llm.generate(
+                prompts=build_vllm_token_prompts(requests),
+                sampling_params=cls._loglikelihood_sampling_params(read_prefix_cache),
+                use_tqdm=True,
+            )
+
+        return _score_loglikelihood_requests(
+            generate, inputs, doc_slices, continuation_lens, count_preemptions=lambda: cls._count_preemptions(llm)
+        )
+
+    def _generate_loglikelihood(
+        self, inputs: list, doc_slices: list[tuple[int, int]], continuation_lens: list[int]
+    ) -> list[LoglikelihoodOutput]:
+        """Score all option requests of a split; ``doc_slices`` groups them per document.
+
+        With ``loglikelihood_prefix_cache`` disabled this is exactly the previous one-request-per-option
+        path (``_generate(generate=False)``). With it enabled the requests read the prefix KV cache and
+        are validated / repaired / selectively re-issued (see ``_score_loglikelihood_requests``). Under
+        data parallelism the documents (not the individual requests) are spread round-robin over the
+        workers so that sibling options land on the same engine and can share its cache.
+        """
+        if not self.config.loglikelihood_prefix_cache:
+            outputs = self._generate(inputs, generate=False)
+            return [LoglikelihoodOutput(o.prompt_token_ids, o.prompt_logprobs) for o in outputs]
+
+        if self.data_parallel_size > 1:
+            outputs, stats = self._generate_loglikelihood_data_parallel(inputs, doc_slices, continuation_lens)
+        else:
+            outputs, stats = self._score_loglikelihood_on_engine(self.model, inputs, doc_slices, continuation_lens)
+
+        self._log_loglikelihood_prefix_cache_stats(stats)
+        return outputs
+
+    def _generate_loglikelihood_data_parallel(
+        self, inputs: list, doc_slices: list[tuple[int, int]], continuation_lens: list[int]
+    ) -> tuple[list[LoglikelihoodOutput], dict]:
+        """Ray/data-parallel variant of ``_score_loglikelihood_on_engine``: one engine per worker,
+        documents dealt round-robin (a document's option requests must share one engine's cache)."""
+
+        @ray.remote(num_gpus=self.tensor_parallel_size)
+        def run_loglikelihood_one_model(model_args: dict, requests: list, slices: list, cont_lens: list):
+            llm = LLM(**model_args)
+            return VLLMModel._score_loglikelihood_on_engine(llm, requests, slices, cont_lens)
+
+        shards: list[list[int]] = [[] for _ in range(self.data_parallel_size)]
+        for doc_index in range(len(doc_slices)):
+            shards[doc_index % self.data_parallel_size].append(doc_index)
+        shards = [shard for shard in shards if shard]
+
+        object_refs = []
+        for shard in shards:
+            requests, slices, cont_lens = [], [], []
+            for doc_index in shard:
+                start, end = doc_slices[doc_index]
+                slices.append((len(requests), len(requests) + end - start))
+                requests.extend(inputs[start:end])
+                cont_lens.extend(continuation_lens[start:end])
+            object_refs.append(run_loglikelihood_one_model.remote(self.model_args, requests, slices, cont_lens))
+        results = ray.get(object_refs)
+        # Invoke ray.shutdown() to prevent hang-ups if subsequent calls required.
+        ray.shutdown()
+
+        outputs: list = [None] * len(inputs)
+        stats: dict = {}
+        for shard, (shard_outputs, shard_stats) in zip(shards, results):
+            position = 0
+            for doc_index in shard:
+                start, end = doc_slices[doc_index]
+                outputs[start:end] = shard_outputs[position : position + end - start]
+                position += end - start
+            for key, value in shard_stats.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    stats[key] = stats.get(key, 0) + value
+                elif value is not None:
+                    stats[key] = value if key not in stats else f"{stats[key]}; {value}"
+        return outputs, stats
+
+    @staticmethod
+    def _log_loglikelihood_prefix_cache_stats(stats: dict) -> None:
+        prompt_tokens = stats.get("prompt_tokens", 0)
+        cached_tokens = stats.get("cached_tokens", 0)
+        share = (100.0 * cached_tokens / prompt_tokens) if prompt_tokens else 0.0
+        message = (
+            "Loglikelihood prefix-cache reuse: %d requests / %d docs; %d/%d prompt tokens (%.1f%%) served from the "
+            "KV cache; sibling recovery on %d requests / %d docs (%d positions); re-issued %d requests / %d docs "
+            "with cache reading disabled; %d preemption(s)."
+        )
+        args = (
+            stats.get("requests", 0),
+            stats.get("docs", 0),
+            cached_tokens,
+            prompt_tokens,
+            share,
+            stats.get("recovered_requests", 0),
+            stats.get("recovered_docs", 0),
+            stats.get("recovered_positions", 0),
+            stats.get("reissued_requests", 0),
+            stats.get("reissued_docs", 0),
+            stats.get("preemptions", 0),
+        )
+        if stats.get("fallback"):
+            logger.warning(message + " Fell back to the safe path: %s.", *args, stats["fallback"])
+        else:
+            logger.info(message, *args)
+
     @cached(SamplingMethod.LOGPROBS)
     def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
         return self._loglikelihood_tokens(docs)
@@ -551,13 +977,21 @@ class VLLMModel(LightevalModel):
             inputs = []
             tokenized_continuations_batch = []
             tokenized_contexts_batch = []
+            doc_slices = []  # (start, end) request-index range of every doc's option requests
 
             for context, doc in zip(contexts, split):
                 tokenized_contexts, tokenized_continuations = self.tok_encode_pair(
                     context, doc.choices, pairwise=self.pairwise_tokenization
                 )
+                doc_start = len(inputs)
                 for tokenized_context, tokenized_continuation in zip(tokenized_contexts, tokenized_continuations):
-                    if doc.images:
+                    if doc.images and self.config.loglikelihood_multimodal_token_prompts:
+                        # Send token ids (context + continuation) plus the images; vLLM's HF processor
+                        # expands the image placeholder tokens in place. The continuation stays at the
+                        # very end, so the logprob slicing below (which counts back ``len(continuation)``
+                        # tokens) lines up regardless of image-token expansion earlier in the prompt.
+                        inputs.append(self._multimodal_token_prompt(tokenized_context + tokenized_continuation, doc))
+                    elif doc.images:
                         # Append the continuation as text and let vLLM's HF processor tokenize the
                         # whole (image + text) prompt. The continuation stays at the very end, so the
                         # logprob slicing below (which counts back ``len(continuation)`` tokens) still
@@ -568,8 +1002,11 @@ class VLLMModel(LightevalModel):
                         inputs.append(tokenized_context + tokenized_continuation)
                     tokenized_continuations_batch.append(tokenized_continuation)
                     tokenized_contexts_batch.append(tokenized_context)
+                doc_slices.append((doc_start, len(inputs)))
 
-            outputs = self._generate(inputs, generate=False)
+            outputs = self._generate_loglikelihood(
+                inputs, doc_slices, [len(continuation) for continuation in tokenized_continuations_batch]
+            )
 
             flat_index = 0
             for i, doc in enumerate(split):
@@ -589,12 +1026,13 @@ class VLLMModel(LightevalModel):
                     continuation_start_idx = actual_input_len - continuation_len
                     continuation_prompt_logprobs = output.prompt_logprobs[continuation_start_idx:]
                     # Use the *actual* prompt token ids at the continuation positions for the
-                    # logprob lookup. In the multimodal path the continuation is appended as text
-                    # and the whole prompt is re-tokenized, so boundary tokens may differ from our
-                    # separately-tokenized ``continuation``. vLLM only includes the top-1 token and
+                    # logprob lookup. In the multimodal text-prompt path the continuation is appended
+                    # as text and the whole prompt is re-tokenized, so boundary tokens may differ from
+                    # our separately-tokenized ``continuation``. vLLM only includes the top-1 token and
                     # the actual prompt token in ``prompt_logprobs`` (prompt_logprobs=1), so looking
                     # up our continuation token directly can raise KeyError. The actual prompt token
-                    # is always present. In the text-only path these tokens equal ``continuation``.
+                    # is always present at a computed position. In the token-id paths these tokens
+                    # equal ``continuation``.
                     actual_continuation_tokens = output.prompt_token_ids[continuation_start_idx:]
 
                     continuation_logprobs = []
