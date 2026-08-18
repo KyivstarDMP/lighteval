@@ -139,11 +139,14 @@ class TestVLLMMultimodalPayload(unittest.TestCase):
         self.assertEqual(payload["prompt"], "Question <start_of_image>")
         self.assertEqual(payload["multi_modal_data"]["image"], [image])
 
-    def test_loglikelihood_attaches_images_to_payload(self):
+    def _loglikelihood_payloads(self, token_prompts: bool):
         model = self._bare_model()
         model._tokenizer = AutoTokenizer.from_pretrained("gpt2")
         model._add_special_tokens = False
         model.pairwise_tokenization = False
+        model.config = Mock()
+        model.config.loglikelihood_prefix_cache = False  # exercise the legacy ``_generate`` path
+        model.config.loglikelihood_multimodal_token_prompts = token_prompts
         model.prompt_manager.prepare_prompt_multimodal.return_value = "Question <start_of_image>\n"
 
         image = Image.new("RGB", (4, 4), (0, 255, 0))
@@ -169,10 +172,30 @@ class TestVLLMMultimodalPayload(unittest.TestCase):
 
         model._generate = fake_generate
         model._loglikelihood_tokens([doc])
+        return model, doc, image, captured["inputs"]
 
-        # One payload per choice, each a multimodal dict carrying the image.
-        self.assertEqual(len(captured["inputs"]), len(doc.choices))
-        for payload in captured["inputs"]:
+    def test_loglikelihood_attaches_images_to_payload(self):
+        model, doc, image, payloads = self._loglikelihood_payloads(token_prompts=False)
+
+        # Default: one text payload per choice, each a multimodal dict carrying the image (the
+        # pre-existing behaviour, kept bit-for-bit: original context string + decoded continuation).
+        self.assertEqual(len(payloads), len(doc.choices))
+        for payload, choice in zip(payloads, doc.choices):
             self.assertIsInstance(payload, dict)
-            self.assertTrue(payload["prompt"].startswith("Question <start_of_image>"))
+            self.assertNotIn("prompt_token_ids", payload)
+            self.assertEqual(payload["prompt"], "Question <start_of_image>\n" + "\n" + choice)
+            self.assertEqual(payload["multi_modal_data"]["image"], [image])
+
+    def test_loglikelihood_token_prompts_carry_images_and_exact_continuation(self):
+        model, doc, image, payloads = self._loglikelihood_payloads(token_prompts=True)
+
+        # ``loglikelihood_multimodal_token_prompts``: pre-tokenized context + continuation plus the
+        # image (token ids, not text: no BOS from vLLM's tokenizer, trailing whitespace scored once).
+        self.assertEqual(len(payloads), len(doc.choices))
+        context_ids = model._tokenizer.encode("Question <start_of_image>", add_special_tokens=False)
+        for payload, choice in zip(payloads, doc.choices):
+            self.assertIsInstance(payload, dict)
+            self.assertNotIn("prompt", payload)
+            self.assertEqual(payload["prompt_token_ids"][: len(context_ids)], context_ids)
+            self.assertEqual(model._tokenizer.decode(payload["prompt_token_ids"][len(context_ids) :]), "\n" + choice)
             self.assertEqual(payload["multi_modal_data"]["image"], [image])
