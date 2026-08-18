@@ -80,6 +80,20 @@ def _common_prefix_len(a: list[int], b: list[int]) -> int:
     return min(len(a), len(b))
 
 
+def _has_real_logprob(entry, token) -> bool:
+    """True iff ``entry`` (a per-position ``{token_id: Logprob}`` dict) holds a numeric logprob for ``token``.
+
+    Presence alone is not enough: vLLM can emit a ``Logprob`` whose ``.logprob`` is ``None`` at
+    positions it did not really compute (seen on gemma-3n at the cache boundary), and lighteval's
+    own ``prompt_logprobs`` uses ``None`` for position 0. Such an entry must count as missing so the
+    request is re-issued on the safe path instead of feeding ``None`` into ``sum``/``argmax``.
+    """
+    if entry is None or token not in entry:
+        return False
+    logprob = getattr(entry[token], "logprob", entry[token])
+    return isinstance(logprob, (int, float)) and logprob == logprob  # not None, not NaN
+
+
 def _valid_prompt_logprob_positions(output) -> range | None:
     """Positions of ``output.prompt_logprobs`` that vLLM actually computed for this request.
 
@@ -118,7 +132,7 @@ def _find_sibling_logprobs(
         if _common_prefix_len(ids, other_ids) <= pos:
             continue
         entry = other_output.prompt_logprobs[pos]
-        if entry is not None and token in entry:
+        if _has_real_logprob(entry, token):
             return entry
     return None
 
@@ -141,8 +155,7 @@ def _resolve_request_prompt_logprobs(
     recovered = 0
     for pos in range(max(len(ids) - continuation_len, 0), len(ids)):
         if pos in valid:
-            entry = own[pos]
-            if entry is None or ids[pos] not in entry:
+            if not _has_real_logprob(own[pos], ids[pos]):
                 return None, 0
             continue
         donor = _find_sibling_logprobs(local, pos, doc_ids, doc_valid, doc_outputs)

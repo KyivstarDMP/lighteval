@@ -288,6 +288,43 @@ class TestResolvePrefixCachedPromptLogprobs:
 # --------------------------------------------------------------------------------------------------
 
 
+class TestNoneLogprobs:
+    """A ``Logprob`` that is *present* but carries ``logprob=None`` must count as missing.
+
+    Regression: on gemma-3n vLLM emitted such entries at cache-boundary positions; the token was in
+    the dict, so a presence check accepted it and ``None`` reached ``sum``/``np.argmax`` in the
+    metric (``TypeError: '>' not supported between instances of 'NoneType' and 'float'``).
+    """
+
+    def test_none_valued_logprob_at_own_valid_position_forces_reissue(self):
+        ids_a, ids_b = CTX + [7, 1], CTX + [7, 2]
+        outs = [FakeOutput(ids_a, 0), FakeOutput(ids_b, 0)]
+        outs[1].prompt_logprobs[17] = {ids_b[17]: FakeLogprob(logprob=None, rank=1)}  # present, no value
+        resolved, stats = _resolve_prefix_cached_prompt_logprobs(outs, [(0, 2)], [2, 2])
+        assert resolved[0] is not None
+        assert resolved[1] is None  # -> re-issued on the safe path, never a None logprob
+        assert stats["reissued_requests"] == 1
+
+    def test_none_valued_logprob_in_donor_is_not_used(self):
+        """Sibling has the token at the shared position but with logprob=None: it is no donor."""
+        ids_a, ids_b = CTX + [7, 1], CTX + [7, 2]
+        outs = [FakeOutput(ids_a, 0), FakeOutput(ids_b, 16)]  # b needs pos 16 from a
+        outs[0].prompt_logprobs[16] = {ids_a[16]: FakeLogprob(logprob=None, rank=1)}
+        resolved, stats = _resolve_prefix_cached_prompt_logprobs(outs, [(0, 2)], [2, 2])
+        # a itself is now unusable at pos 16 (own valid position with a None value) -> re-issue
+        assert resolved[0] is None
+        # b cannot recover pos 16 from a -> re-issue
+        assert resolved[1] is None
+        assert stats["reissued_requests"] == 2
+
+    def test_nan_valued_logprob_is_treated_like_none(self):
+        ids_a, ids_b = CTX + [7, 1], CTX + [7, 2]
+        outs = [FakeOutput(ids_a, 0), FakeOutput(ids_b, 0)]
+        outs[1].prompt_logprobs[17] = {ids_b[17]: FakeLogprob(logprob=float("nan"), rank=1)}
+        resolved, _ = _resolve_prefix_cached_prompt_logprobs(outs, [(0, 2)], [2, 2])
+        assert resolved[1] is None
+
+
 class TestScoreLoglikelihoodRequests:
     @staticmethod
     def _engine(cached_by_request: dict[int, int], calls: list):
