@@ -196,11 +196,10 @@ class LiteLLMClient(LightevalModel):
 
     def _prepare_stop_sequence(self, stop_sequence):
         """Prepare and validate stop sequence."""
-        if self.provider == "anthropic":
+        if self.provider == "anthropic" and stop_sequence:
             # Filter out whitespace-only stop sequences
-            if stop_sequence:
-                stop_sequence = [s for s in stop_sequence if s and s.strip()]
-        return stop_sequence
+            stop_sequence = [s for s in stop_sequence if s and s.strip()]
+        return stop_sequence or None
 
     @staticmethod
     def _encode_image_base64(image) -> str:

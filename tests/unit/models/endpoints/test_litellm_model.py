@@ -51,7 +51,9 @@ def _build_client(model_name: str, generation_parameters: GenerationParameters) 
     return client
 
 
-def _run_call_api(client: LiteLLMClient, *, supports_reasoning: bool) -> Mock:
+def _run_call_api(
+    client: LiteLLMClient, *, supports_reasoning: bool, stop_sequence: list[str] | tuple | None = None
+) -> Mock:
     """Drive ``__call_api`` once against a mocked ``litellm.acompletion``, returning that mock.
 
     Callers assert on ``.call_args.kwargs`` to check what was sent to the provider.
@@ -69,7 +71,7 @@ def _run_call_api(client: LiteLLMClient, *, supports_reasoning: bool) -> Mock:
                     return_logits=False,
                     max_new_tokens=64,
                     num_samples=1,
-                    stop_sequence=None,
+                    stop_sequence=stop_sequence,
                 )
             )
 
@@ -128,6 +130,36 @@ def test_call_api_openai_reasoning_keeps_max_completion_tokens():
     completion_kwargs = _run_call_api(client, supports_reasoning=True).call_args.kwargs
     assert completion_kwargs["max_tokens"] == 640
     assert completion_kwargs["max_completion_tokens"] == 96
+
+
+@pytest.mark.parametrize("stop_sequence", [None, (), []], ids=["none", "empty-tuple", "empty-list"])
+def test_call_api_sends_no_stop_when_task_has_no_stop_sequence(stop_sequence):
+    # Tasks without stop sequences carry an empty tuple; OpenAI rejects `stop=[]`, so it must reach
+    # litellm as None (which litellm drops) rather than as an empty container.
+    client = _build_client("openai/gpt-4.1-nano", GenerationParameters())
+
+    completion_kwargs = _run_call_api(client, supports_reasoning=False, stop_sequence=stop_sequence).call_args.kwargs
+    assert completion_kwargs.get("stop") is None
+
+
+def test_call_api_forwards_task_stop_sequence():
+    client = _build_client("openai/gpt-4.1-nano", GenerationParameters())
+
+    completion_kwargs = _run_call_api(client, supports_reasoning=False, stop_sequence=["\n"]).call_args.kwargs
+    assert completion_kwargs["stop"] == ["\n"]
+
+
+@pytest.mark.parametrize(
+    "stop_sequence, expected_stop",
+    [(["\n", "Answer:"], ["Answer:"]), (["\n"], None)],
+    ids=["keeps-non-whitespace", "all-whitespace-becomes-none"],
+)
+def test_call_api_anthropic_drops_whitespace_only_stop_sequences(stop_sequence, expected_stop):
+    client = _build_client("anthropic/claude-sonnet-4-5", GenerationParameters())
+    client.provider = "anthropic"
+
+    completion_kwargs = _run_call_api(client, supports_reasoning=False, stop_sequence=stop_sequence).call_args.kwargs
+    assert completion_kwargs.get("stop") == expected_stop
 
 
 def _build_client_for_greedy_until(model_name: str) -> LiteLLMClient:
