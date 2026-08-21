@@ -219,10 +219,9 @@ class VLLMOpenAIClient(LightevalModel):
     def _sampling_params(self) -> tuple[dict, dict]:
         """Split generation parameters into standard OpenAI params and vLLM extras.
 
-        Standard params ride as SDK keyword arguments; vLLM-only sampling knobs
-        (``top_k``, ``min_p``, ``repetition_penalty``) travel in ``extra_body``
-        — plain body fields the vLLM server accepts. LiteLLM silently dropped
-        these (``drop_params=True``); here they reach the engine again.
+        Standard params ride as SDK keyword arguments; vLLM-only knobs travel in
+        ``extra_body`` — plain body fields the vLLM server accepts. LiteLLM
+        silently dropped these (``drop_params=True``).
         """
         gp = self.generation_parameters
         standard = {
@@ -236,6 +235,8 @@ class VLLMOpenAIClient(LightevalModel):
             "top_k": gp.top_k,
             "min_p": gp.min_p,
             "repetition_penalty": gp.repetition_penalty,
+            "skip_special_tokens": gp.skip_special_tokens,
+            "min_tokens": gp.min_new_tokens,
         }
         return (
             {k: v for k, v in standard.items() if v is not None},

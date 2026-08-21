@@ -196,6 +196,31 @@ class TestPayloadMapping:
         }
         assert extra == {"top_k": 64, "min_p": 0.05, "repetition_penalty": 1.05}
 
+    def test_skip_special_tokens_false_reaches_extra_body(self):
+        """False is falsy: the payload filter must key on `is not None`."""
+        client = make_client(
+            generation_parameters=GenerationParameters(temperature=1.0, top_k=64, skip_special_tokens=False)
+        )
+        _, extra = client._sampling_params()
+        assert extra["skip_special_tokens"] is False
+
+    def test_min_new_tokens_maps_to_min_tokens(self):
+        client = make_client(generation_parameters=GenerationParameters(min_new_tokens=16))
+        _, extra = client._sampling_params()
+        assert extra["min_tokens"] == 16
+
+    def test_unset_vllm_knobs_are_omitted(self):
+        _, extra = make_client(generation_parameters=GenerationParameters(temperature=0.5))._sampling_params()
+        assert "skip_special_tokens" not in extra
+        assert "min_tokens" not in extra
+
+    def test_skip_special_tokens_reaches_chat_completion_call(self):
+        client = make_client(generation_parameters=GenerationParameters(temperature=1.0, skip_special_tokens=False))
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_response())
+        run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "q"}], 32, 1))
+        assert sdk.chat.completions.create.call_args.kwargs["extra_body"]["skip_special_tokens"] is False
+
     def test_default_temperature_zero_is_sent(self):
         standard, extra = make_client()._sampling_params()
         assert standard == {"temperature": 0}
