@@ -27,6 +27,8 @@
     title: Use HF's inference providers as backend
   - local: use-litellm-as-backend
     title: Use litellm as backend
+  - local: use-vllm-openai-as-backend
+    title: Use a vLLM OpenAI server as backend
   - local: use-vllm-as-backend
     title: Use vllm as backend
   - local: use-sglang-as-backend

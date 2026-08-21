@@ -321,6 +321,107 @@ def litellm(
 
 
 @app.command(rich_help_panel="Evaluation Backends")
+def vllm_openai(
+    # === general ===
+    model_args: Annotated[
+        str,
+        Argument(
+            help="config file path for the vLLM OpenAI-endpoint model, or a comma separated string of model args "
+            "(model_name={},base_url={},use_chat_template={})"
+        ),
+    ],
+    tasks: tasks.type,
+    # === Common parameters ===
+    load_tasks_multilingual: load_tasks_multilingual.type = load_tasks_multilingual.default,
+    dataset_loading_processes: dataset_loading_processes.type = dataset_loading_processes.default,
+    num_fewshot_seeds: num_fewshot_seeds.type = num_fewshot_seeds.default,
+    custom_tasks: custom_tasks.type = custom_tasks.default,
+    load_responses_from_details_date_id: load_responses_from_details_date_id.type = load_responses_from_details_date_id.default,
+    remove_reasoning_tags: remove_reasoning_tags.type = remove_reasoning_tags.default,
+    reasoning_tags: reasoning_tags.type = reasoning_tags.default,
+    # === saving ===
+    output_dir: output_dir.type = output_dir.default,
+    results_path_template: results_path_template.type = results_path_template.default,
+    push_to_hub: push_to_hub.type = push_to_hub.default,
+    push_to_tensorboard: push_to_tensorboard.type = push_to_tensorboard.default,
+    public_run: public_run.type = public_run.default,
+    results_org: results_org.type = results_org.default,
+    save_details: save_details.type = save_details.default,
+    wandb: wandb.type = wandb.default,
+    # === debug ===
+    max_samples: max_samples.type = max_samples.default,
+    job_id: job_id.type = job_id.default,
+):
+    """Evaluate models served by a vLLM OpenAI-compatible server (``vllm serve``).
+
+    Talks to the server directly through the OpenAI SDK — no provider routing.
+    Supports chat-templated and plain-text generation, and loglikelihood
+    scoring for both (chat-templated LL uses vLLM's ``prompt_logprobs``
+    chat-completions extension, incl. multimodal docs).
+
+    Returns:
+        dict: Evaluation results containing metrics and scores for all tasks
+    """
+    import yaml
+
+    from lighteval.logging.evaluation_tracker import EvaluationTracker
+    from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIModelConfig
+    from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+
+    evaluation_tracker = EvaluationTracker(
+        output_dir=output_dir,
+        results_path_template=results_path_template,
+        save_details=save_details,
+        push_to_hub=push_to_hub,
+        push_to_tensorboard=push_to_tensorboard,
+        public=public_run,
+        hub_results_org=results_org,
+        use_wandb=wandb,
+    )
+
+    parallelism_manager = ParallelismManager.NONE
+
+    if model_args.endswith(".yaml"):
+        with open(model_args, "r") as f:
+            config = yaml.safe_load(f)
+        metric_options = config.get("metric_options", {})
+        model_config = VLLMOpenAIModelConfig.from_path(model_args)
+    else:
+        metric_options = None
+        model_config = VLLMOpenAIModelConfig.from_args(model_args)
+
+    pipeline_params = PipelineParameters(
+        launcher_type=parallelism_manager,
+        load_tasks_multilingual=load_tasks_multilingual,
+        job_id=job_id,
+        dataset_loading_processes=dataset_loading_processes,
+        custom_tasks_directory=custom_tasks,
+        num_fewshot_seeds=num_fewshot_seeds,
+        max_samples=max_samples,
+        load_responses_from_details_date_id=load_responses_from_details_date_id,
+        remove_reasoning_tags=remove_reasoning_tags,
+        reasoning_tags=reasoning_tags,
+    )
+    pipeline = Pipeline(
+        tasks=tasks,
+        pipeline_parameters=pipeline_params,
+        evaluation_tracker=evaluation_tracker,
+        model_config=model_config,
+        metric_options=metric_options,
+    )
+
+    pipeline.evaluate()
+
+    pipeline.show_results()
+
+    results = pipeline.get_results()
+
+    pipeline.save_and_push_results()
+
+    return results
+
+
+@app.command(rich_help_panel="Evaluation Backends")
 def inference_providers(
     # === general ===
     model_args: Annotated[
