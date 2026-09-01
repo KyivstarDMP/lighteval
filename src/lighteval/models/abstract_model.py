@@ -23,7 +23,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 import torch
 import yaml
@@ -90,6 +90,8 @@ class ModelConfig(BaseModel, extra="forbid"):
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     image_placement: ImagePlacement = ImagePlacement.inline
     cache_dir: str = "~/.cache/huggingface/lighteval"
+
+    CACHE_KEY_EXCLUDE: ClassVar[frozenset[str]] = frozenset()
 
     @classmethod
     def from_path(cls, path: str):
@@ -160,7 +162,13 @@ class ModelConfig(BaseModel, extra="forbid"):
 
         args = re.sub(r"generation_parameters=\{.*?\},?", "", args).strip(",")
         args = re.sub(r"chat_template_kwargs=\{.*?\},?", "", args).strip(",")
-        model_config = {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in args.split(",")}
+        model_config = {}
+        for part in ModelConfig._split_top_level_args(args):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                model_config[key.strip()] = ModelConfig._strip_matching_quotes(value.strip())
+            else:
+                model_config[part.strip()] = True
 
         if generation_parameters_dict is not None:
             model_config["generation_parameters"] = generation_parameters_dict
@@ -168,6 +176,41 @@ class ModelConfig(BaseModel, extra="forbid"):
             model_config["chat_template_kwargs"] = chat_template_kwargs_dict
 
         return model_config
+
+    @staticmethod
+    def _split_top_level_args(args: str) -> list[str]:
+        """Split a comma-separated ``key=value`` string on top-level commas only.
+
+        A comma inside a quoted value (``system_prompt="Be helpful, concise"``)
+        does not start a new field — without this, a comma anywhere in a string
+        value (e.g. a system prompt) silently truncated it and turned the
+        remainder into a spurious boolean flag.
+        """
+        parts = []
+        current = []
+        quote_char = None
+        for char in args:
+            if quote_char:
+                current.append(char)
+                if char == quote_char:
+                    quote_char = None
+            elif char in "\"'":
+                quote_char = char
+                current.append(char)
+            elif char == ",":
+                parts.append("".join(current))
+                current = []
+            else:
+                current.append(char)
+        parts.append("".join(current))
+        return [part for part in parts if part]
+
+    @staticmethod
+    def _strip_matching_quotes(value: str) -> str:
+        """Strip a single layer of matching surrounding quotes, if present."""
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            return value[1:-1]
+        return value
 
 
 class InspectAIModelConfig(BaseModel):
@@ -217,7 +260,14 @@ class InspectAIModelConfig(BaseModel):
             }
         """
         args = re.sub(r"generation_parameters=\{.*?\},?", "", args).strip(",")
-        return {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in args.split(",")}
+        model_config = {}
+        for part in ModelConfig._split_top_level_args(args):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                model_config[key.strip()] = ModelConfig._strip_matching_quotes(value.strip())
+            else:
+                model_config[part.strip()] = True
+        return model_config
 
     @classmethod
     def from_path(cls, path: str):

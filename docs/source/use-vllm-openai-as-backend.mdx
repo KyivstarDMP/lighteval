@@ -1,0 +1,65 @@
+# Use a vLLM OpenAI-compatible server as backend
+
+The `vllm-openai` endpoint backend evaluates models served by
+[`vllm serve`](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
+(or any deployment of vLLM's OpenAI-compatible server). It talks to the server
+directly through the OpenAI SDK — no provider routing, no model-name prefixes —
+and uses vLLM-specific API extensions that generic clients drop.
+
+```bash
+lighteval endpoint vllm-openai \
+    "model_name=org/my-model,base_url=http://localhost:8000/v1" \
+    "leaderboard|truthfulqa:mc|0"
+```
+
+## Supported evaluation modes
+
+| Mode | Method | Route |
+|------|--------|-------|
+| **Generative (chat)** | `greedy_until` with `use_chat_template=true` (default) | `POST /v1/chat/completions` |
+| **Generative (plain text)** | `greedy_until` with `use_chat_template=false` (base models) | `POST /v1/completions` |
+| **Log-likelihood, chat-templated** (text **and** vision) | `loglikelihood` with `use_chat_template=true` | `POST /v1/chat/completions` with vLLM's `prompt_logprobs` + `continue_final_message` extensions |
+| **Log-likelihood, plain text** | `loglikelihood` with `use_chat_template=false` | `POST /v1/completions` with `echo=True`, `logprobs=1` |
+| **Rolling log-likelihood (perplexity)** | `loglikelihood_rolling` | `POST /v1/completions` with `echo=True` |
+
+Chat-templated loglikelihood scores each choice as an *unterminated assistant
+reply*: the server renders its chat template with
+`continue_final_message=true`, so the scored prompt ends exactly with the
+continuation, and the continuation tokens are isolated by suffix-aligning the
+server's returned token pieces. This also works for multimodal (image) docs.
+
+> [!WARNING]
+> Chat templates that whitespace-trim message content (e.g. Gemma's `| trim`)
+> drop a continuation's leading space server-side; alignment accounts for this
+> by retrying against the stripped form and absorbing the template's boundary
+> whitespace.
+
+## Configuration
+
+```yaml
+model_parameters:
+    model_name: "org/my-model"           # exactly as the server knows it
+    base_url: "http://localhost:8000/v1" # required
+    use_chat_template: true              # false for base models
+    concurrent_requests: 64
+    timeout: 600
+    max_model_length: 32768              # probed from /models when unset
+    chat_template_kwargs:                # forwarded to the server's template
+        enable_thinking: false
+    generation_parameters:
+        temperature: 0
+```
+
+Unlike generic OpenAI clients, vLLM-only sampling parameters
+(`top_k`, `min_p`, `repetition_penalty`) are forwarded to the server, and
+`chat_template_kwargs` reaches the server's template rendering (e.g. Qwen's
+`enable_thinking` switch).
+
+Retry behavior is tuned for a local server: connection failures abort quickly
+(the server is supposed to be up), transient overload (429/5xx/timeouts) backs
+off exponentially, and malformed/oversized single requests degrade to empty
+results instead of failing the run.
+
+Operational fields (`base_url`, timeouts, concurrency, retries) are excluded
+from the sample-cache key, so re-serving the model on a different port reuses
+cached samples.

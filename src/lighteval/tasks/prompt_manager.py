@@ -20,6 +20,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+import base64
+import io
 import logging
 import random
 import re
@@ -60,6 +62,19 @@ def _normalize_image_placement(placement: "ImagePlacement | str") -> "ImagePlace
             f"or {ALLOWED_IMAGE_PLACEMENTS[-1]}, not {placement}"
         )
     return ImagePlacement[placement]
+
+
+def encode_image_base64(image) -> str:
+    """Encode a PIL image as a base64 data URI for OpenAI-style image_url content."""
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
+def image_url_parts(images) -> list[dict]:
+    """OpenAI-style ``image_url`` content parts for a list of PIL images."""
+    return [{"type": "image_url", "image_url": {"url": encode_image_base64(image)}} for image in images]
 
 
 def order_multimodal_content(
@@ -130,7 +145,28 @@ class PromptManager:
         if self.use_chat_template:
             return self._prepare_chat_template(doc)
         else:
-            return self._prepare_plain_text(doc)
+            return self.prepare_plain_text(doc)
+
+    def prepare_multimodal_messages(self, doc: Doc, image_parts: list[dict]) -> list[dict]:
+        """Chat messages for a multimodal doc, before any chat-template rendering.
+
+        Images are placed per ``image_placement``; the system prompt and the
+        doc instruction are merged into one system turn when either is present.
+        ``image_parts`` carries the backend's content-part format (``image``
+        for local tokenizers, ``image_url`` for OpenAI-style APIs).
+        """
+        content = order_multimodal_content(doc.query, image_parts, placement=self.image_placement)
+        messages = [{"role": "user", "content": content}]
+
+        if (
+            self.system_prompt is not None or doc.instruction is not None
+        ):  # We add system prompt and instruction jointly if possible
+            system_prompt = self.system_prompt if self.system_prompt is not None else ""
+            instruction = doc.instruction if doc.instruction is not None else ""
+            system_content = [{"type": "text", "text": system_prompt + instruction}]
+            messages.insert(0, {"role": "system", "content": system_content})
+
+        return messages
 
     def prepare_prompt_multimodal(self, doc: Doc) -> str:
         if self.use_chat_template is False or self.tokenizer is None:
@@ -140,23 +176,10 @@ class PromptManager:
             raise ValueError("Multimodal prompts require images to be provided in the document.")
 
         image_parts = [{"type": "image", "image": image} for image in doc.images]
-        content = order_multimodal_content(doc.query, image_parts, placement=self.image_placement)
-        message = {"role": "user", "content": content}
-
-        if (
-            self.system_prompt is not None or doc.instruction is not None
-        ):  # We add system prompt and instruction jointly if possible
-            system_prompt = self.system_prompt if self.system_prompt is not None else ""
-            instruction = doc.instruction if doc.instruction is not None else ""
-            system_content = [{"type": "text", "text": system_prompt + instruction}]
-            system_prompt_message = {"role": "system", "content": system_content}
-            message = [system_prompt_message, message]
-
-        else:
-            message = [message]
+        messages = self.prepare_multimodal_messages(doc, image_parts)
 
         return self.tokenizer.apply_chat_template(
-            message,
+            messages,
             tokenize=False,
             add_generation_prompt=True,
             **self.chat_template_kwargs,
@@ -170,6 +193,19 @@ class PromptManager:
             list[dict[str, str]]: List of message dictionaries for API calls
         """
         return self._prepare_chat_template(doc, tokenize=False)
+
+    def prepare_prompt_api_multimodal(self, doc: Doc) -> list[dict]:
+        """Chat messages for API backends with the doc's images attached to the main user query.
+
+        Reuses ``prepare_prompt_api`` for the text/few-shot structure, then converts the last
+        (main query) message into a multimodal content list per ``image_placement``.
+        """
+        messages = self.prepare_prompt_api(doc)
+        last_message = messages[-1]
+        last_message["content"] = order_multimodal_content(
+            last_message["content"], image_url_parts(doc.images), placement=self.image_placement
+        )
+        return messages
 
     def _prepare_chat_template(self, doc: Doc, tokenize: bool = True) -> str:
         """Prepare prompt using chat template format.
@@ -216,7 +252,7 @@ class PromptManager:
         else:  # for apis
             return messages
 
-    def _prepare_plain_text(self, doc: Doc) -> str:
+    def prepare_plain_text(self, doc: Doc) -> str:
         """Prepare prompt using plain text format.
 
         Returns:
