@@ -313,5 +313,9 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
                 result = result[:start] + result[end + len(end_tag) :]
             else:
                 break
+        # A span that opens and never closes (the budget ran out mid-thought) is
+        # all reasoning: score it as an empty answer, as server-side parsers do.
+        if start_tag and start_tag in result:
+            result = result[: result.find(start_tag)]
 
     return result

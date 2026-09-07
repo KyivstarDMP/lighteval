@@ -42,7 +42,7 @@ model_parameters:
     base_url: "http://localhost:8000/v1" # required
     use_chat_template: true              # false for base models
     concurrent_requests: 64
-    timeout: 600
+    timeout: 600                        # stall bound between streamed chunks, not a generation length
     max_model_length: 32768              # probed from /models when unset
     chat_template_kwargs:                # forwarded to the server's template
         enable_thinking: false
@@ -55,10 +55,25 @@ Unlike generic OpenAI clients, vLLM-only sampling parameters
 `chat_template_kwargs` reaches the server's template rendering (e.g. Qwen's
 `enable_thinking` switch).
 
-Retry behavior is tuned for a local server: connection failures abort quickly
-(the server is supposed to be up), transient overload (429/5xx/timeouts) backs
-off exponentially, and malformed/oversized single requests degrade to empty
-results instead of failing the run.
+Generations are streamed, so `timeout` bounds the gap between two chunks
+(including the wait before the first one: server queueing plus prefill), never
+the length of the whole generation — a 32k-token answer needs no special
+timeout. Retry behavior is tuned for a local server: connection failures abort
+quickly (the server is supposed to be up), a stalled stream is not retried
+(the request degrades to an empty result; eight consecutive stalls abort the
+run as a dead server), transient overload (429/5xx) backs off exponentially,
+and malformed/oversized single requests degrade to empty results instead of
+failing the run.
+
+Loglikelihood is scored from client-side token ids by default
+(`client_tokenization: true`): the context is rendered locally — the chat
+template with a generation prompt, or plain text — context and choices are
+split into ids exactly like the in-process backend (`tok_encode_pair`), and the
+ids go to `/v1/completions` with `echo=true`, so the continuation is simply the
+last `len(ids)` positions. This keeps the in-process boundary convention; the
+tokenizer is loaded from `model_name` (or `tokenizer`). Docs with images use
+vLLM's server-templated `prompt_logprobs` chat route; `client_tokenization:
+false` keeps the server-templated routes for everything.
 
 Operational fields (`base_url`, timeouts, concurrency, retries) are excluded
 from the sample-cache key, so re-serving the model on a different port reuses

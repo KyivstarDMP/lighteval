@@ -60,9 +60,11 @@ def make_client(
     use_chat_template=True,
     api_max_retry=2,
     generation_parameters=None,
+    client_tokenization=False,
 ):
     """Construct a VLLMOpenAIClient bypassing __init__ (no cache, no SDK client)."""
     client = object.__new__(VLLMOpenAIClient)
+    client.client_tokenization = client_tokenization
     client.model = model
     client.base_url = base_url
     client.api_key = None
@@ -87,6 +89,56 @@ def make_sdk_chat_response(prompt_logprobs=None, content="ok"):
     if prompt_logprobs is not None:
         response.prompt_logprobs = prompt_logprobs
     return response
+
+
+def make_sdk_chat_stream(pieces, reasoning_pieces=None, n=1, finish_reason="stop"):
+    """Async iterator standing in for an SDK chat AsyncStream: one chunk per piece, per sample index."""
+
+    async def chunks():
+        for index in range(n):
+            for piece in reasoning_pieces or []:
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=index,
+                            finish_reason=None,
+                            delta=SimpleNamespace(content=None, reasoning_content=piece),
+                        )
+                    ]
+                )
+            for piece in pieces:
+                yield SimpleNamespace(
+                    choices=[
+                        SimpleNamespace(
+                            index=index,
+                            finish_reason=None,
+                            delta=SimpleNamespace(content=piece, reasoning_content=None),
+                        )
+                    ]
+                )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=index,
+                        finish_reason=finish_reason,
+                        delta=SimpleNamespace(content=None, reasoning_content=None),
+                    )
+                ]
+            )
+
+    return chunks()
+
+
+def make_sdk_completion_stream(pieces, n=1, finish_reason="stop"):
+    """Async iterator standing in for an SDK completion AsyncStream."""
+
+    async def chunks():
+        for index in range(n):
+            for piece in pieces:
+                yield SimpleNamespace(choices=[SimpleNamespace(index=index, finish_reason=None, text=piece)])
+            yield SimpleNamespace(choices=[SimpleNamespace(index=index, finish_reason=finish_reason, text=None)])
+
+    return chunks()
 
 
 def make_sdk_completion_response(tokens, token_logprobs, top_logprobs=None, text_offset=None, text="t"):
@@ -217,7 +269,7 @@ class TestPayloadMapping:
     def test_skip_special_tokens_reaches_chat_completion_call(self):
         client = make_client(generation_parameters=GenerationParameters(temperature=1.0, skip_special_tokens=False))
         sdk = MagicMock()
-        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_response())
+        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["ok"]))
         run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "q"}], 32, 1))
         assert sdk.chat.completions.create.call_args.kwargs["extra_body"]["skip_special_tokens"] is False
 
@@ -230,13 +282,14 @@ class TestPayloadMapping:
         client = make_client(generation_parameters=GenerationParameters(temperature=1.0, top_k=64))
         client.prompt_manager.chat_template_kwargs = {"enable_thinking": False}
         sdk = MagicMock()
-        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_response())
+        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["ok"]))
 
         run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 128, 1))
 
         kwargs = sdk.chat.completions.create.call_args.kwargs
         assert kwargs["model"] == "org/model-it"
         assert kwargs["max_tokens"] == 128
+        assert kwargs["stream"] is True  # the timeout bounds chunk gaps, not the whole generation
         # No stop sequences on the chat route: chat models terminate via EOS
         # (in-process VLLMModel parity; a reasoning model opening "<think>\n"
         # must not be cut by a task's "\n" stop marker).
@@ -255,13 +308,14 @@ class TestPayloadMapping:
     def test_text_generative_payload_uses_prompt(self):
         client = make_client(use_chat_template=False)
         sdk = MagicMock()
-        sdk.completions.create = AsyncMock(return_value=make_sdk_completion_response(["t"], [None]))
+        sdk.completions.create = AsyncMock(return_value=make_sdk_completion_stream(["t"]))
 
         run(client._call_api_text_generative(sdk, "plain prompt", 64, 1, None))
 
         kwargs = sdk.completions.create.call_args.kwargs
         assert kwargs["prompt"] == "plain prompt"
         assert kwargs["max_tokens"] == 64
+        assert kwargs["stream"] is True
         assert "messages" not in kwargs
 
     def test_echo_payload_is_deterministic_scoring(self):
@@ -346,11 +400,239 @@ class TestRetryClassification:
         call = AsyncMock(side_effect=[_status_error(429), good])
         assert run(client._request(call, label="test")) is good
 
-    def test_timeout_backs_off_then_succeeds(self):
+    def test_timeout_is_a_stall_degraded_without_retry(self):
         client = make_client(api_max_retry=3)
+        call = AsyncMock(side_effect=_timeout_error())
+        assert run(client._request(call, label="test")) is None
+        assert call.await_count == 1
+
+    def test_consecutive_stalls_abort_the_run_and_a_success_resets_the_count(self):
+        client = make_client()
+        stalled = AsyncMock(side_effect=_timeout_error())
+        for _ in range(7):
+            assert run(client._request(stalled, label="test")) is None
         good = make_sdk_chat_response()
-        call = AsyncMock(side_effect=[_timeout_error(), good])
-        assert run(client._request(call, label="test")) is good
+        assert run(client._request(AsyncMock(return_value=good), label="test")) is good  # resets
+        for _ in range(7):
+            assert run(client._request(stalled, label="test")) is None
+        with pytest.raises(RuntimeError, match="stalled on 8 consecutive"):
+            run(client._request(stalled, label="test"))
+
+
+# ---------------------------------------------------------------------------
+# 3b. Streamed generation
+# ---------------------------------------------------------------------------
+
+
+class TestStreamedGeneration:
+    def test_chat_stream_folds_content_and_reasoning_per_sample(self):
+        client = make_client()
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(
+            return_value=make_sdk_chat_stream(
+                ["Hel", "lo"], reasoning_pieces=["thi", "nk"], n=2, finish_reason="length"
+            )
+        )
+        response = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 2))
+        assert [choice.message.content for choice in response.choices] == ["Hello", "Hello"]
+        assert [choice.message.reasoning_content for choice in response.choices] == ["think", "think"]
+        assert [choice.finish_reason for choice in response.choices] == ["length", "length"]
+
+    def test_chat_stream_reads_vllms_reasoning_field(self):
+        """vLLM streams the parsed channel as `reasoning`; `reasoning_content` is the older spelling."""
+
+        async def chunks():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(index=0, finish_reason=None, delta=SimpleNamespace(content=None, reasoning="why "))
+                ]
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(index=0, finish_reason=None, delta=SimpleNamespace(content=None, reasoning="not"))
+                ]
+            )
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(index=0, finish_reason="stop", delta=SimpleNamespace(content="42", reasoning=None))
+                ]
+            )
+
+        client = make_client()
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=chunks())
+        response = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1))
+        assert response.choices[0].message.reasoning_content == "why not"
+        assert response.choices[0].message.content == "42"
+
+    def test_chat_stream_without_reasoning_reports_none(self):
+        client = make_client()
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["A"]))
+        response = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1))
+        assert response.choices[0].message.content == "A"
+        assert response.choices[0].message.reasoning_content is None
+
+    def test_text_stream_folds_text(self):
+        client = make_client(use_chat_template=False)
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(return_value=make_sdk_completion_stream(["a", "b", "c"]))
+        response = run(client._call_api_text_generative(sdk, "p", 8, 1, None))
+        assert response.choices[0].text == "abc"
+
+    def test_empty_stream_yields_empty_choices_not_none(self):
+        """An empty generation must reach greedy_until as text [""], not as a degraded request."""
+
+        async def nothing():
+            return
+            yield
+
+        client = make_client()
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=nothing())
+        response = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1))
+        assert [choice.message.content for choice in response.choices] == [""]
+
+    def test_greedy_until_reads_the_folded_stream(self):
+        client = make_client()
+        doc = Doc(query="Q?", choices=[], gold_index=0, task_name="t", generation_size=8)
+        doc.id = "0"
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(
+            return_value=make_sdk_chat_stream(["fin", "al"], reasoning_pieces=["r"])
+        )
+        sdk.__aenter__ = AsyncMock(return_value=sdk)
+        sdk.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            (result,) = client.greedy_until([doc])
+        assert result.text == ["final"]
+        assert result.reasonings == ["r"]
+
+
+# ---------------------------------------------------------------------------
+# 3c. Loglikelihood from client-side token ids
+# ---------------------------------------------------------------------------
+
+
+class FakeTokenizer:
+    """One id per character; BOS = 1 when special tokens are requested; a visible chat template."""
+
+    eos_token_id = 0
+
+    def encode(self, text, add_special_tokens=False):
+        return ([1] if add_special_tokens else []) + [ord(c) for c in text]
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        return "".join(m["content"] for m in messages) + ("<gen>" if add_generation_prompt else "")
+
+
+def _echo_response_for(prompt_ids):
+    """Echo logprobs shaped like vLLM's: None for the first prompt token, one generated token at the end."""
+    tokens = [chr(i) for i in prompt_ids] + ["g"]
+    token_logprobs = [None] + [-0.5] * (len(prompt_ids) - 1) + [-9.0]
+    top_logprobs = [{tok: lp if lp is not None else 0.0} for tok, lp in zip(tokens, token_logprobs)]
+    return make_sdk_completion_response(tokens, token_logprobs, top_logprobs=top_logprobs)
+
+
+def _token_client(**kwargs):
+    client = make_client(client_tokenization=True, **kwargs)
+    client._tokenizer = FakeTokenizer()
+    return client
+
+
+class TestTokenIdLoglikelihood:
+    def test_chat_context_is_rendered_locally_and_sent_as_ids(self):
+        client = _token_client()
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(side_effect=lambda **kw: _echo_response_for(kw["prompt"]))
+        doc = make_doc("ab", [" c", " dd"])
+
+        result = run(client._process_doc_token_loglikelihood_async(doc, sdk, asyncio.Semaphore(4)))
+
+        context = "ab<gen>"  # the local chat template, with the generation prompt
+        assert result.input == context
+        sent = [call.kwargs["prompt"] for call in sdk.completions.create.call_args_list]
+        assert sent == [[ord(c) for c in context + " c"], [ord(c) for c in context + " dd"]]  # no BOS under a template
+        assert result.output_tokens == [[ord(c) for c in " c"], [ord(c) for c in " dd"]]
+        assert result.logprobs == pytest.approx(
+            [-1.0, -1.5]
+        )  # last len(continuation) positions, generated token excluded
+        assert result.argmax_logits_eq_gold == [True, True]
+        payload = sdk.completions.create.call_args.kwargs
+        assert payload["echo"] is True and payload["logprobs"] == 1 and payload["max_tokens"] == 1
+
+    def test_plain_text_context_gets_bos_and_the_continuation_does_not(self):
+        client = _token_client(use_chat_template=False)
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(side_effect=lambda **kw: _echo_response_for(kw["prompt"]))
+        doc = make_doc("ab", [" c"])
+
+        result = run(client._process_doc_token_loglikelihood_async(doc, sdk, asyncio.Semaphore(4)))
+
+        (sent,) = [call.kwargs["prompt"] for call in sdk.completions.create.call_args_list]
+        assert sent[0] == 1 and sent[1:] == [ord(c) for c in "ab c"]
+        assert result.input_tokens == [[1, ord("a"), ord("b")]]
+        assert result.logprobs == pytest.approx([-1.0])
+
+    def test_boundary_whitespace_belongs_to_the_continuation(self):
+        """tok_encode_pair moves trailing context spaces into the continuation, as in-process."""
+        client = _token_client(use_chat_template=False)
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(side_effect=lambda **kw: _echo_response_for(kw["prompt"]))
+        doc = make_doc("ab ", ["c"])
+        result = run(client._process_doc_token_loglikelihood_async(doc, sdk, asyncio.Semaphore(4)))
+        assert result.output_tokens == [[ord(" "), ord("c")]]
+        assert result.logprobs == pytest.approx([-1.0])
+
+    def test_degraded_request_scores_minus_inf(self):
+        client = _token_client()
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(return_value=None)
+        with patch.object(client, "_request", AsyncMock(return_value=None)):
+            result = run(
+                client._process_doc_token_loglikelihood_async(make_doc("q", [" a"]), sdk, asyncio.Semaphore(1))
+            )
+        assert result.logprobs == [float("-inf")] and result.argmax_logits_eq_gold == [False]
+
+    def test_images_keep_the_server_templated_chat_route(self):
+        client = _token_client()
+        pil = pytest.importorskip("PIL.Image")
+        docs = [make_doc("Q?", [" A"], images=[pil.new("RGB", (2, 2))]), make_doc("plain", [" B"], doc_id="1")]
+        calls = []
+
+        async def fake_chat(doc, client, semaphore):
+            calls.append(("chat", doc.query))
+            return ModelResponse(input="x", logprobs=[-0.1], argmax_logits_eq_gold=[True])
+
+        async def fake_tokens(doc, client, semaphore):
+            calls.append(("ids", doc.query))
+            return ModelResponse(input="y", logprobs=[-0.2], argmax_logits_eq_gold=[True])
+
+        with (
+            patch.object(client, "_process_doc_chat_loglikelihood_async", side_effect=fake_chat),
+            patch.object(client, "_process_doc_token_loglikelihood_async", side_effect=fake_tokens),
+        ):
+            results = run(client._loglikelihood_async(docs, AsyncMock()))
+        assert calls == [("chat", "Q?"), ("ids", "plain")]
+        assert [r.logprobs for r in results] == [[-0.1], [-0.2]]
+
+    def test_add_special_tokens_default_follows_the_template(self):
+        assert _token_client().add_special_tokens is False
+        assert _token_client(use_chat_template=False).add_special_tokens is True
+        explicit = _token_client()
+        explicit._add_special_tokens = True
+        assert explicit.add_special_tokens is True
+
+    def test_client_tokenization_off_keeps_legacy_routes(self):
+        client = make_client()
+        docs = [make_doc("Q?", [" A"])]
+
+        async def fake_chat(doc, client, semaphore):
+            return ModelResponse(input="x", logprobs=[-0.3], argmax_logits_eq_gold=[True])
+
+        with patch.object(client, "_process_doc_chat_loglikelihood_async", side_effect=fake_chat):
+            (result,) = run(client._loglikelihood_async(docs, AsyncMock()))
+        assert result.logprobs == [-0.3]
 
 
 # ---------------------------------------------------------------------------
