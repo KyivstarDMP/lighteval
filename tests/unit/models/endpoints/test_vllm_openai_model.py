@@ -623,6 +623,24 @@ class TestTokenIdLoglikelihood:
         explicit._add_special_tokens = True
         assert explicit.add_special_tokens is True
 
+    def test_tokenizer_runs_repo_code_only_when_configured(self):
+        loads = []
+
+        def fake_from_pretrained(name, **kwargs):
+            loads.append((name, kwargs))
+            return MagicMock()
+
+        with patch("transformers.AutoTokenizer.from_pretrained", side_effect=fake_from_pretrained):
+            for trust in (None, True):
+                extra = {} if trust is None else {"trust_remote_code": trust}
+                config = VLLMOpenAIModelConfig(model_name="org/model-it", base_url="http://x/v1", **extra)
+                VLLMOpenAIClient(config).tokenizer
+        assert loads == [
+            ("org/model-it", {"trust_remote_code": False}),
+            ("org/model-it", {"trust_remote_code": True}),
+        ]
+        assert "trust_remote_code" in VLLMOpenAIModelConfig.CACHE_KEY_EXCLUDE
+
     def test_client_tokenization_off_keeps_legacy_routes(self):
         client = make_client()
         docs = [make_doc("Q?", [" A"])]

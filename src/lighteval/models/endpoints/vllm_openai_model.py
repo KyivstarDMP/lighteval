@@ -169,6 +169,9 @@ class VLLMOpenAIModelConfig(ModelConfig):
         tokenizer (str | None):
             Tokenizer to load for client tokenization when it differs from
             ``model_name``.
+        trust_remote_code (bool):
+            Let the client tokenizer run code from the model repo; default
+            ``False``. Only for repos whose tokenizer is not a transformers class.
         add_special_tokens (bool | None):
             BOS handling for client tokenization. ``None`` (default) adds them
             for plain-text prompts and not for chat-templated ones, which carry
@@ -199,6 +202,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
 
     client_tokenization: bool = True
     tokenizer: str | None = None
+    trust_remote_code: bool = False
     add_special_tokens: bool | None = None
     pairwise_tokenization: bool = False
 
@@ -207,6 +211,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
             "base_url",
             "api_key",
             "tokenizer",
+            "trust_remote_code",
             "concurrent_requests",
             "timeout",
             "api_max_retry",
@@ -223,6 +228,7 @@ class VLLMOpenAIClient(LightevalModel):
     pairwise_tokenization = False
     _tokenizer = None
     _tokenizer_id: str | None = None
+    _trust_remote_code = False
     _add_special_tokens: bool | None = None
 
     def __init__(self, config: VLLMOpenAIModelConfig) -> None:
@@ -237,6 +243,7 @@ class VLLMOpenAIClient(LightevalModel):
         self.client_tokenization = config.client_tokenization
         self.pairwise_tokenization = config.pairwise_tokenization
         self._tokenizer_id = config.tokenizer
+        self._trust_remote_code = config.trust_remote_code
         self._add_special_tokens = config.add_special_tokens
 
         self.API_MAX_RETRY = config.api_max_retry
@@ -882,7 +889,9 @@ class VLLMOpenAIClient(LightevalModel):
         if self._tokenizer is None and self.client_tokenization:
             from transformers import AutoTokenizer
 
-            self._tokenizer = AutoTokenizer.from_pretrained(self._tokenizer_id or self.model, trust_remote_code=True)
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                self._tokenizer_id or self.model, trust_remote_code=self._trust_remote_code
+            )
         if self._tokenizer is not None:
             self.prompt_manager.tokenizer = self._tokenizer
         return self._tokenizer
