@@ -529,6 +529,19 @@ class TestStreamedGeneration:
         assert "truncate_prompt_tokens" not in sent_extra_body(20)  # no room left: send as is
         assert "truncate_prompt_tokens" not in sent_extra_body(100, images=[pil.new("RGB", (2, 2))])
 
+    def test_text_generation_route_sends_the_bos_choice(self):
+        def sent(add_special_tokens):
+            client = make_client(use_chat_template=False)
+            client._add_special_tokens = add_special_tokens
+            sdk = MagicMock()
+            sdk.completions.create = AsyncMock(return_value=make_sdk_completion_stream(["ok"]))
+            run(client._call_api_text_generative(sdk, "<bos>rendered template", 8, 1, None))
+            return sdk.completions.create.call_args.kwargs["extra_body"]["add_special_tokens"]
+
+        assert sent(None) is True
+        assert sent(True) is True
+        assert sent(False) is False
+
     def test_text_generation_route_carries_the_prompt_room(self):
         client = make_client(use_chat_template=False)
         sdk = MagicMock()

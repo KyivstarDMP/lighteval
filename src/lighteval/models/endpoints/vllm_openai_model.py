@@ -179,7 +179,8 @@ class VLLMOpenAIModelConfig(ModelConfig):
             Let the client tokenizer run code from the model repo; default
             ``False``. Only for repos whose tokenizer is not a transformers class.
         add_special_tokens (bool | None):
-            BOS handling for client tokenization. ``None`` (default) adds them
+            BOS handling for client tokenization and for the plain-text prompts
+            the server tokenizes on generation. ``None`` (default) adds them
             for plain-text prompts and not for chat-templated ones, which carry
             their own.
         pairwise_tokenization (bool):
@@ -425,6 +426,7 @@ class VLLMOpenAIClient(LightevalModel):
         self, client: AsyncOpenAI, prompt: str, max_new_tokens, num_samples, stop, *, prompt_room: int | None = None
     ):
         standard, extra_body = self._sampling_params()
+        extra_body["add_special_tokens"] = self.add_special_tokens
         if prompt_room is not None:
             extra_body["truncate_prompt_tokens"] = prompt_room
 
