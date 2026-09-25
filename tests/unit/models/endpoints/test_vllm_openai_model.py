@@ -508,6 +508,34 @@ class TestStreamedGeneration:
         assert result.text == ["final"]
         assert result.reasonings == ["r"]
 
+    def test_generation_prompts_are_held_to_the_context_budget_except_images(self):
+        pil = pytest.importorskip("PIL.Image")
+
+        def sent_extra_body(budget, images=None):
+            client = make_client()
+            client._context_budget = budget
+            doc = Doc(query="Q?", choices=[], gold_index=0, task_name="t", generation_size=30, images=images)
+            doc.id = "0"
+            sdk = MagicMock()
+            sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["ok"]))
+            sdk.__aenter__ = AsyncMock(return_value=sdk)
+            sdk.__aexit__ = AsyncMock(return_value=False)
+            with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+                client.greedy_until([doc])
+            return sdk.chat.completions.create.call_args.kwargs["extra_body"] or {}
+
+        assert sent_extra_body(100)["truncate_prompt_tokens"] == 70  # budget minus the answer's max_new_tokens
+        assert "truncate_prompt_tokens" not in sent_extra_body(None)
+        assert "truncate_prompt_tokens" not in sent_extra_body(20)  # no room left: send as is
+        assert "truncate_prompt_tokens" not in sent_extra_body(100, images=[pil.new("RGB", (2, 2))])
+
+    def test_text_generation_route_carries_the_prompt_room(self):
+        client = make_client(use_chat_template=False)
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(return_value=make_sdk_completion_stream(["ok"]))
+        run(client._call_api_text_generative(sdk, "p", 8, 1, None, prompt_room=5))
+        assert sdk.completions.create.call_args.kwargs["extra_body"]["truncate_prompt_tokens"] == 5
+
 
 # ---------------------------------------------------------------------------
 # 3c. Loglikelihood from client-side token ids
@@ -640,6 +668,24 @@ class TestTokenIdLoglikelihood:
             ("org/model-it", {"trust_remote_code": True}),
         ]
         assert "trust_remote_code" in VLLMOpenAIModelConfig.CACHE_KEY_EXCLUDE
+
+    def test_ids_over_the_context_budget_keep_their_tail(self):
+        client = _token_client()
+        client._context_budget = 6  # room for 5 ids beside the one generated token
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(side_effect=lambda **kw: _echo_response_for(kw["prompt"]))
+
+        result = run(
+            client._process_doc_token_loglikelihood_async(make_doc("abcdef", [" c"]), sdk, asyncio.Semaphore(4))
+        )
+
+        assert sdk.completions.create.call_args.kwargs["prompt"] == [ord(c) for c in ("abcdef<gen>" + " c")[-5:]]
+        assert result.logprobs == pytest.approx([-1.0])  # the continuation is still the last 2 positions
+        assert result.input_tokens == [[ord(c) for c in "abcdef<gen>"]]  # reported untruncated
+
+        client._context_budget = 3  # a continuation longer than the room is never cut into
+        run(client._process_doc_token_loglikelihood_async(make_doc("ab", [" dd"]), sdk, asyncio.Semaphore(4)))
+        assert sdk.completions.create.call_args.kwargs["prompt"] == [ord(c) for c in "ab<gen> dd"]
 
     def test_client_tokenization_off_keeps_legacy_routes(self):
         client = make_client()

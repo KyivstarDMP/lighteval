@@ -155,7 +155,13 @@ class VLLMOpenAIModelConfig(ModelConfig):
             Loglikelihood requests are not streamed; for them it is the whole
             request, which is short.
         max_model_length (int | None):
-            Server context window. When unset, probed once from ``/models``.
+            The invocation's context budget, held per request whatever window
+            the server was started with: generation prompts are left-truncated
+            by the server (``truncate_prompt_tokens``) and log-likelihood token
+            ids by the client, keeping the last tokens that leave room for the
+            answer — the in-process backend's rule. Docs with images are never
+            truncated. When unset, nothing is truncated and ``max_length`` is
+            probed once from ``/models``.
         client_tokenization (bool):
             ``True`` (default) scores loglikelihood from client-side token ids:
             the context is rendered locally (chat template with a generation
@@ -229,6 +235,7 @@ class VLLMOpenAIClient(LightevalModel):
     _tokenizer = None
     _tokenizer_id: str | None = None
     _trust_remote_code = False
+    _context_budget: int | None = None
     _add_special_tokens: bool | None = None
 
     def __init__(self, config: VLLMOpenAIModelConfig) -> None:
@@ -240,6 +247,7 @@ class VLLMOpenAIClient(LightevalModel):
         self.concurrent_requests = config.concurrent_requests
         self.timeout = config.timeout
         self._max_length = config.max_model_length
+        self._context_budget = config.max_model_length
         self.client_tokenization = config.client_tokenization
         self.pairwise_tokenization = config.pairwise_tokenization
         self._tokenizer_id = config.tokenizer
@@ -377,8 +385,19 @@ class VLLMOpenAIClient(LightevalModel):
     # Generative routes
     # ------------------------------------------------------------------
 
-    async def _call_api_chat_generative(self, client: AsyncOpenAI, messages, max_new_tokens, num_samples):
+    def _prompt_room(self, reserve: int | None) -> int | None:
+        """Prompt tokens the context budget leaves after ``reserve``; None when there is nothing to hold."""
+        if self._context_budget is None or not reserve:
+            return None
+        room = self._context_budget - reserve
+        return room if room > 0 else None
+
+    async def _call_api_chat_generative(
+        self, client: AsyncOpenAI, messages, max_new_tokens, num_samples, *, prompt_room: int | None = None
+    ):
         standard, extra_body = self._sampling_params()
+        if prompt_room is not None:
+            extra_body["truncate_prompt_tokens"] = prompt_room
         if self.prompt_manager.chat_template_kwargs:
             extra_body["chat_template_kwargs"] = dict(self.prompt_manager.chat_template_kwargs)
 
@@ -402,8 +421,12 @@ class VLLMOpenAIClient(LightevalModel):
 
         return await self._request(call, label="chat completion")
 
-    async def _call_api_text_generative(self, client: AsyncOpenAI, prompt: str, max_new_tokens, num_samples, stop):
+    async def _call_api_text_generative(
+        self, client: AsyncOpenAI, prompt: str, max_new_tokens, num_samples, stop, *, prompt_room: int | None = None
+    ):
         standard, extra_body = self._sampling_params()
+        if prompt_room is not None:
+            extra_body["truncate_prompt_tokens"] = prompt_room
 
         async def call():
             stream = await client.completions.create(
@@ -456,13 +479,19 @@ class VLLMOpenAIClient(LightevalModel):
                         # running serially for the whole split up front.
                         async with semaphore:
                             context = self._prepare_context(doc)
+                            prompt_room = None if doc.images else self._prompt_room(max_new_tokens)
                             if use_chat_template:
                                 response = await self._call_api_chat_generative(
-                                    client, context, max_new_tokens, num_samples
+                                    client, context, max_new_tokens, num_samples, prompt_room=prompt_room
                                 )
                             else:
                                 response = await self._call_api_text_generative(
-                                    client, context, max_new_tokens, num_samples, stop_sequence
+                                    client,
+                                    context,
+                                    max_new_tokens,
+                                    num_samples,
+                                    stop_sequence,
+                                    prompt_room=prompt_room,
                                 )
                             return context, response
 
@@ -600,6 +629,8 @@ class VLLMOpenAIClient(LightevalModel):
         context = self.prompt_manager.prepare_prompt(doc)
         context_ids, continuation_ids = self.tok_encode_pair(context, doc.choices, pairwise=self.pairwise_tokenization)
         prompts = [list(ctx) + list(cont) for ctx, cont in zip(context_ids, continuation_ids)]
+        if (room := self._prompt_room(1)) is not None:
+            prompts = [p[-room:] if len(cont) < room else p for p, cont in zip(prompts, continuation_ids)]
 
         async def bounded_call(prompt_ids):
             async with semaphore:
