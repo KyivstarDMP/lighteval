@@ -83,6 +83,10 @@ class TestCaching(unittest.TestCase):
             DummyModelConfig,
         ]
 
+        from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIModelConfig
+
+        model_configs.append(VLLMOpenAIModelConfig)
+
         for model_config in model_configs:
             with self.subTest(model_config=model_config):
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,7 +94,12 @@ class TestCaching(unittest.TestCase):
                     # if model_config in [AdapterModelConfig, DeltaModelConfig]:
                     #    config = model_config(model_name=model_name, base_model=model_name + "2", cache_dir=temp_dir)
                     # else:
-                    config = model_config(model_name=model_name, cache_dir=temp_dir)
+                    extra_kwargs = {}
+                    if model_config is VLLMOpenAIModelConfig:
+                        # base_url is deliberately required (the backend always
+                        # talks to an explicit server).
+                        extra_kwargs["base_url"] = "http://localhost:8000/v1"
+                    config = model_config(model_name=model_name, cache_dir=temp_dir, **extra_kwargs)
 
                     # Create cache with custom directory
                     cache = SampleCache(config)
@@ -127,6 +136,11 @@ class TestCaching(unittest.TestCase):
             SGLangModel,
             DummyModel,
         ]
+
+        from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIClient
+
+        model_classes.append(VLLMOpenAIClient)
+
         methods_to_check = ["greedy_until", "loglikelihood", "loglikelihood_rolling"]
 
         for model_class in model_classes:

@@ -1,0 +1,80 @@
+# Use a vLLM OpenAI-compatible server as backend
+
+The `vllm-openai` endpoint backend evaluates models served by
+[`vllm serve`](https://docs.vllm.ai/en/latest/serving/openai_compatible_server.html)
+(or any deployment of vLLM's OpenAI-compatible server). It talks to the server
+directly through the OpenAI SDK — no provider routing, no model-name prefixes —
+and uses vLLM-specific API extensions that generic clients drop.
+
+```bash
+lighteval endpoint vllm-openai \
+    "model_name=org/my-model,base_url=http://localhost:8000/v1" \
+    "leaderboard|truthfulqa:mc|0"
+```
+
+## Supported evaluation modes
+
+| Mode | Method | Route |
+|------|--------|-------|
+| **Generative (chat)** | `greedy_until` with `use_chat_template=true` (default) | `POST /v1/chat/completions` |
+| **Generative (plain text)** | `greedy_until` with `use_chat_template=false` (base models) | `POST /v1/completions` |
+| **Log-likelihood, chat-templated** (text **and** vision) | `loglikelihood` with `use_chat_template=true` | `POST /v1/chat/completions` with vLLM's `prompt_logprobs` + `continue_final_message` extensions |
+| **Log-likelihood, plain text** | `loglikelihood` with `use_chat_template=false` | `POST /v1/completions` with `echo=True`, `logprobs=1` |
+| **Rolling log-likelihood (perplexity)** | `loglikelihood_rolling` | `POST /v1/completions` with `echo=True` |
+
+Chat-templated loglikelihood scores each choice as an *unterminated assistant
+reply*: the server renders its chat template with
+`continue_final_message=true`, so the scored prompt ends exactly with the
+continuation, and the continuation tokens are isolated by suffix-aligning the
+server's returned token pieces. This also works for multimodal (image) docs.
+
+> [!WARNING]
+> Chat templates that whitespace-trim message content (e.g. Gemma's `| trim`)
+> drop a continuation's leading space server-side; alignment accounts for this
+> by retrying against the stripped form and absorbing the template's boundary
+> whitespace.
+
+## Configuration
+
+```yaml
+model_parameters:
+    model_name: "org/my-model"           # exactly as the server knows it
+    base_url: "http://localhost:8000/v1" # required
+    use_chat_template: true              # false for base models
+    concurrent_requests: 64
+    timeout: 600                        # stall bound between streamed chunks, not a generation length
+    max_model_length: 32768              # probed from /models when unset
+    chat_template_kwargs:                # forwarded to the server's template
+        enable_thinking: false
+    generation_parameters:
+        temperature: 0
+```
+
+Unlike generic OpenAI clients, vLLM-only sampling parameters
+(`top_k`, `min_p`, `repetition_penalty`) are forwarded to the server, and
+`chat_template_kwargs` reaches the server's template rendering (e.g. Qwen's
+`enable_thinking` switch).
+
+Generations are streamed, so `timeout` bounds the gap between two chunks
+(including the wait before the first one: server queueing plus prefill), never
+the length of the whole generation — a 32k-token answer needs no special
+timeout. Retry behavior is tuned for a local server: connection failures abort
+quickly (the server is supposed to be up), a stalled stream is not retried
+(the request degrades to an empty result; eight consecutive stalls abort the
+run as a dead server), transient overload (429/5xx) backs off exponentially,
+and malformed/oversized single requests degrade to empty results instead of
+failing the run.
+
+Loglikelihood is scored from client-side token ids by default
+(`client_tokenization: true`): the context is rendered locally — the chat
+template with a generation prompt, or plain text — context and choices are
+split into ids exactly like the in-process backend (`tok_encode_pair`), and the
+ids go to `/v1/completions` with `echo=true`, so the continuation is simply the
+last `len(ids)` positions. This keeps the in-process boundary convention; the
+tokenizer is loaded from `model_name` (or `tokenizer`). Docs with images use
+vLLM's server-templated `prompt_logprobs` chat route; `client_tokenization:
+false` keeps the server-templated routes for everything.
+
+Operational fields (`base_url`, timeouts, concurrency, retries) are excluded
+from the sample-cache key, so re-serving the model on a different port reuses
+cached samples.

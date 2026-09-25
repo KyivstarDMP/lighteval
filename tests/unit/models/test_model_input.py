@@ -80,3 +80,52 @@ class TestGenerationParameters:
         gen = GenerationParameters(max_new_tokens=128, temperature=0.1, reasoning_effort="low")
 
         assert gen.to_vllm_openai_dict() == {"max_new_tokens": 128, "temperature": 0.1}
+
+
+class TestToLitellmDict:
+    """Tests for GenerationParameters.to_litellm_dict() — regression coverage for PR #1193."""
+
+    def test_presence_penalty_included(self):
+        """presence_penalty must not be silently dropped (bug fix PR #1193)."""
+        gen = GenerationParameters(presence_penalty=0.4)
+        result = gen.to_litellm_dict()
+        assert "presence_penalty" in result
+        assert result["presence_penalty"] == pytest.approx(0.4)
+
+    def test_temperature_zero_included(self):
+        """temperature=0 (the default) is included since 0 is not None."""
+        gen = GenerationParameters()
+        result = gen.to_litellm_dict()
+        assert "temperature" in result
+        assert result["temperature"] == 0
+
+    def test_all_params_forwarded(self):
+        """All chat-completion params are forwarded with correct key names."""
+        gen = GenerationParameters(
+            max_new_tokens=200,
+            stop_tokens=["\n", "END"],
+            temperature=0.8,
+            top_p=0.95,
+            seed=7,
+            repetition_penalty=1.05,
+            frequency_penalty=0.1,
+            presence_penalty=0.2,
+        )
+        result = gen.to_litellm_dict()
+        assert result["max_completion_tokens"] == 200
+        assert result["stop"] == ["\n", "END"]
+        assert result["temperature"] == pytest.approx(0.8)
+        assert result["top_p"] == pytest.approx(0.95)
+        assert result["seed"] == 7
+        assert result["repetition_penalty"] == pytest.approx(1.05)
+        assert result["frequency_penalty"] == pytest.approx(0.1)
+        assert result["presence_penalty"] == pytest.approx(0.2)
+
+    def test_none_values_excluded(self):
+        """Parameters left as None are not forwarded."""
+        gen = GenerationParameters(temperature=0.5)
+        result = gen.to_litellm_dict()
+        assert "max_completion_tokens" not in result
+        assert "stop" not in result
+        assert "seed" not in result
+        assert "top_p" not in result

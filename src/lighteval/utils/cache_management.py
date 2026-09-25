@@ -145,7 +145,7 @@ class SampleCache:
             str: A 16-character hexadecimal hash of the model configuration
         """
         # Use Pydantic's model_dump instead of asdict for BaseModel
-        config_dict = model_config.model_dump()
+        config_dict = model_config.model_dump(exclude=set(model_config.CACHE_KEY_EXCLUDE))
         config_str = json.dumps(config_dict, sort_keys=True, default=str)
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
