@@ -677,10 +677,27 @@ class TestTokenIdLoglikelihood:
                 config = VLLMOpenAIModelConfig(model_name="org/model-it", base_url="http://x/v1", **extra)
                 VLLMOpenAIClient(config).tokenizer
         assert loads == [
-            ("org/model-it", {"trust_remote_code": False}),
-            ("org/model-it", {"trust_remote_code": True}),
+            ("org/model-it", {"revision": None, "trust_remote_code": False}),
+            ("org/model-it", {"revision": None, "trust_remote_code": True}),
         ]
         assert "trust_remote_code" in VLLMOpenAIModelConfig.CACHE_KEY_EXCLUDE
+
+    def test_tokenizer_loads_the_pinned_revision_of_the_model_repo(self):
+        loads = []
+
+        def fake_from_pretrained(name, **kwargs):
+            loads.append((name, kwargs["revision"]))
+            return MagicMock()
+
+        sha = "0123456789abcdef0123456789abcdef01234567"
+        with patch("transformers.AutoTokenizer.from_pretrained", side_effect=fake_from_pretrained):
+            for extra in ({}, {"tokenizer": "org/other-tokenizer"}):
+                config = VLLMOpenAIModelConfig(
+                    model_name="org/model-it", base_url="http://x/v1", revision=sha, **extra
+                )
+                VLLMOpenAIClient(config).tokenizer
+        assert loads == [("org/model-it", sha), ("org/other-tokenizer", None)]
+        assert "revision" not in VLLMOpenAIModelConfig.CACHE_KEY_EXCLUDE
 
     def test_ids_over_the_context_budget_keep_their_tail(self):
         client = _token_client()

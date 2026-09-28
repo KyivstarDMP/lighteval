@@ -175,6 +175,10 @@ class VLLMOpenAIModelConfig(ModelConfig):
         tokenizer (str | None):
             Tokenizer to load for client tokenization when it differs from
             ``model_name``.
+        revision (str | None):
+            Model repo revision (a commit SHA pins it) the client tokenizer
+            loads, matching the server's ``--revision``. Applies to
+            ``model_name``; ignored when ``tokenizer`` names another repo.
         trust_remote_code (bool):
             Let the client tokenizer run code from the model repo; default
             ``False``. Only for repos whose tokenizer is not a transformers class.
@@ -209,6 +213,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
 
     client_tokenization: bool = True
     tokenizer: str | None = None
+    revision: str | None = None
     trust_remote_code: bool = False
     add_special_tokens: bool | None = None
     pairwise_tokenization: bool = False
@@ -252,6 +257,7 @@ class VLLMOpenAIClient(LightevalModel):
         self.client_tokenization = config.client_tokenization
         self.pairwise_tokenization = config.pairwise_tokenization
         self._tokenizer_id = config.tokenizer
+        self._revision = None if config.tokenizer else config.revision
         self._trust_remote_code = config.trust_remote_code
         self._add_special_tokens = config.add_special_tokens
 
@@ -923,7 +929,7 @@ class VLLMOpenAIClient(LightevalModel):
             from transformers import AutoTokenizer
 
             self._tokenizer = AutoTokenizer.from_pretrained(
-                self._tokenizer_id or self.model, trust_remote_code=self._trust_remote_code
+                self._tokenizer_id or self.model, revision=self._revision, trust_remote_code=self._trust_remote_code
             )
         if self._tokenizer is not None:
             self.prompt_manager.tokenizer = self._tokenizer
