@@ -1513,3 +1513,13 @@ class TestErrorsInsideAStream:
         sdk.chat.completions.create = AsyncMock(side_effect=lambda **kwargs: breaks_mid_stream())
         assert run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1)) is None
         assert sdk.chat.completions.create.await_count >= 2
+
+
+def test_the_connection_pool_holds_every_request_in_flight():
+    # 2026-09-29: 2000 in flight through the SDK's default 1000-connection pool ran at 9k tok/s; a pool of 2000, 119k.
+    client = make_client()
+    client.concurrent_requests = 2048
+    with patch.object(openai, "DefaultAsyncHttpxClient", wraps=openai.DefaultAsyncHttpxClient) as http_client:
+        client._make_client()
+    limits = http_client.call_args.kwargs["limits"]
+    assert (limits.max_connections, limits.max_keepalive_connections) == (2048, 2048)

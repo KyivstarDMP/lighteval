@@ -529,12 +529,20 @@ class VLLMOpenAIClient(LightevalModel):
     # ------------------------------------------------------------------
 
     def _make_client(self) -> AsyncOpenAI:
-        """One SDK client per event-loop scope (each public method runs its own loop)."""
+        """One SDK client per event-loop scope (each public method runs its own loop).
+
+        Its connection pool holds ``concurrent_requests``: past the SDK's default of 1000, requests queue inside
+        httpx, whose pool handling grows costlier with the queue until it starves the event loop.
+        """
+        limits = httpx.Limits(
+            max_connections=self.concurrent_requests, max_keepalive_connections=self.concurrent_requests
+        )
         return AsyncOpenAI(
             base_url=self.base_url,
             api_key=self.api_key or "EMPTY",
             timeout=self.timeout if self.timeout is not None else NOT_GIVEN,
             max_retries=0,  # retry classification is ours, not the SDK's
+            http_client=openai.DefaultAsyncHttpxClient(limits=limits),
         )
 
     async def _fetch_load(self) -> str | None:
