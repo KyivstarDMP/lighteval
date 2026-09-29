@@ -40,7 +40,9 @@ and, when exhausted, degrades that one request.
 """
 
 import asyncio
+import contextlib
 import logging
+import time
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -71,9 +73,85 @@ _CONNECT_RETRY_SLEEP_S = 1.0
 # Consecutive stalled generations (across requests) before the server is declared dead.
 _STALL_ABORT_AFTER = 8
 _DEFAULT_MAX_LENGTH = 4096
+_DEFAULT_STALL_S = 600.0  # the stall bound when the config leaves `timeout` unset
 
 
-async def _collect_chat_stream(stream, num_samples: int):
+class _ProgressClock:
+    """When any stream last received a chunk: a request still queued behind others stalls only if this went quiet."""
+
+    def __init__(self) -> None:
+        self.last = time.monotonic()
+
+    def tick(self) -> None:
+        self.last = time.monotonic()
+
+
+class _Quiet(Exception):
+    pass
+
+
+class _StreamStall(openai.APITimeoutError):
+    """A request that stopped making progress; handled like the SDK's own timeout."""
+
+    def __init__(self, detail: str, request: httpx.Request) -> None:
+        openai.APIConnectionError.__init__(self, message=detail, request=request)
+
+
+async def _await_unless_quiet(awaitable, *, quiet_for, stall_s: float):
+    """Await ``awaitable``, raising ``_Quiet`` once ``quiet_for()`` reaches ``stall_s`` seconds before it finishes."""
+    task = asyncio.ensure_future(awaitable)
+    poll = min(15.0, stall_s / 4)
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=poll)
+            if done:
+                return task.result()
+            if quiet_for() >= stall_s:
+                raise _Quiet
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+async def _stream_chunks(stream, *, progress: _ProgressClock, stall_s: float):
+    """Yield ``stream``'s chunks, raising ``_StreamStall`` when it stalls.
+
+    Before its first chunk a request is queued behind others, not stuck: it stalls only when no stream anywhere has
+    received a chunk for ``stall_s``. Once started, the gap between its own chunks is bounded by ``stall_s``.
+    """
+    iterator = stream.__aiter__()
+    opened = last_chunk = time.monotonic()
+    started = False
+
+    def quiet_for() -> float:
+        return time.monotonic() - (last_chunk if started else max(progress.last, opened))
+
+    try:
+        while True:
+            try:
+                chunk = await _await_unless_quiet(iterator.__anext__(), quiet_for=quiet_for, stall_s=stall_s)
+            except StopAsyncIteration:
+                return
+            except _Quiet:
+                source = "this stream" if started else "any stream"
+                request = getattr(getattr(stream, "response", None), "request", None)
+                raise _StreamStall(
+                    f"no chunk from {source} for {stall_s:g}s", request or httpx.Request("POST", "http://vllm/stream")
+                ) from None
+            started = True
+            last_chunk = time.monotonic()
+            progress.tick()
+            yield chunk
+    finally:
+        closer = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+        if closer is not None:
+            with contextlib.suppress(Exception):
+                await closer()
+
+
+async def _collect_chat_stream(
+    stream, num_samples: int, *, progress: _ProgressClock | None = None, stall_s: float = _DEFAULT_STALL_S
+):
     """Fold a chat-completion stream into the shape ``greedy_until`` reads (``choices[i].message``).
 
     Streaming is what makes the client timeout a stall bound rather than a
@@ -83,7 +161,8 @@ async def _collect_chat_stream(stream, num_samples: int):
     content: list[list[str]] = [[] for _ in range(num_samples)]
     reasoning: list[list[str]] = [[] for _ in range(num_samples)]
     finish: list[str | None] = [None] * num_samples
-    async for chunk in stream:
+    chunks = stream if progress is None else _stream_chunks(stream, progress=progress, stall_s=stall_s)
+    async for chunk in chunks:
         for choice in getattr(chunk, "choices", None) or []:
             index = getattr(choice, "index", 0) or 0
             while index >= len(content):
@@ -109,11 +188,14 @@ async def _collect_chat_stream(stream, num_samples: int):
     )
 
 
-async def _collect_text_stream(stream, num_samples: int):
+async def _collect_text_stream(
+    stream, num_samples: int, *, progress: _ProgressClock | None = None, stall_s: float = _DEFAULT_STALL_S
+):
     """Fold a text-completion stream into ``choices[i].text``."""
     text: list[list[str]] = [[] for _ in range(num_samples)]
     finish: list[str | None] = [None] * num_samples
-    async for chunk in stream:
+    chunks = stream if progress is None else _stream_chunks(stream, progress=progress, stall_s=stall_s)
+    async for chunk in chunks:
         for choice in getattr(chunk, "choices", None) or []:
             index = getattr(choice, "index", 0) or 0
             while index >= len(text):
@@ -147,10 +229,12 @@ class VLLMOpenAIModelConfig(ModelConfig):
         concurrent_requests (int):
             Client-side request concurrency. Default 10.
         timeout (float | None):
-            Stall timeout in seconds (SDK default when unset). Generations are
-            streamed, so this bounds the gap between two chunks — including the
-            wait before the first one (server queueing + prefill) — not the
-            length of the whole generation. A stalled request is not retried;
+            Stall bound in seconds (600 when unset). Generations are streamed,
+            so it is never the length of a generation: a request that has
+            started stalls when its own chunks stop for this long, while one
+            still queued behind others stalls only when no stream at all has
+            received a chunk for this long (a busy server is not a dead one,
+            however long its queue). A stalled request is not retried;
             ``_STALL_ABORT_AFTER`` consecutive stalls abort the evaluation.
             Loglikelihood requests are not streamed; for them it is the whole
             request, which is short.
@@ -235,6 +319,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
 
 class VLLMOpenAIClient(LightevalModel):
     _consecutive_stalls = 0  # reset by any completed request
+    _progress: _ProgressClock | None = None
     # Client-side tokenization state (class defaults so tests can build instances without __init__).
     client_tokenization = True
     pairwise_tokenization = False
@@ -288,15 +373,42 @@ class VLLMOpenAIClient(LightevalModel):
             max_retries=0,  # retry classification is ours, not the SDK's
         )
 
+    def _clock(self) -> _ProgressClock:
+        if self._progress is None:
+            self._progress = _ProgressClock()
+        return self._progress
+
+    def _stall_s(self) -> float:
+        return self.timeout if self.timeout is not None else _DEFAULT_STALL_S
+
+    def _stream_timeout(self) -> httpx.Timeout:
+        # No read timeout: `_stream_chunks` tells a queued request from a stuck one, which a per-read timer cannot.
+        return httpx.Timeout(self._stall_s(), read=None)
+
+    async def _open_stream(self, create):
+        """Await the SDK call that opens a stream under the same queued-versus-stuck rule as its chunks."""
+        opened = time.monotonic()
+        progress = self._clock()
+        try:
+            return await _await_unless_quiet(
+                create, quiet_for=lambda: time.monotonic() - max(progress.last, opened), stall_s=self._stall_s()
+            )
+        except _Quiet:
+            raise _StreamStall(
+                f"no chunk from any stream for {self._stall_s():g}s while opening the request",
+                httpx.Request("POST", f"{self.base_url}/completions"),
+            ) from None
+
     async def _request(self, call, *, label: str):
         """Run ``await call()`` with local-server retry semantics.
 
         - Connection failures (server process gone): a couple of quick retries,
           then **raise** — the serving pipeline is responsible for the server
           being up, and every subsequent request would fail the same way.
-        - Timeouts (a stalled stream): no retry — a resample of the same prompt
-          stalls the same way — degrade this one request to ``None``; after
-          ``_STALL_ABORT_AFTER`` consecutive stalls the server is dead, **raise**.
+        - Timeouts (a stalled stream, see ``_stream_chunks``): no retry — a
+          resample of the same prompt stalls the same way — degrade this one
+          request to ``None``; after ``_STALL_ABORT_AFTER`` consecutive stalls
+          the server is dead, **raise**.
         - 429 / 5xx (transient overload): exponential backoff up to
           ``api_max_retry``, then degrade this one request to ``None``.
         - Other 4xx (bad request, e.g. context overflow): no retry, degrade to
@@ -308,7 +420,7 @@ class VLLMOpenAIClient(LightevalModel):
                 result = await call()
                 self._consecutive_stalls = 0
                 return result
-            except openai.APITimeoutError as e:
+            except (openai.APITimeoutError, httpx.TimeoutException) as e:
                 self._consecutive_stalls += 1
                 if self._consecutive_stalls >= _STALL_ABORT_AFTER:
                     raise RuntimeError(
@@ -415,16 +527,19 @@ class VLLMOpenAIClient(LightevalModel):
             # completion-style markers ("\n", ...) that would truncate
             # legitimate output — a reasoning model opening with "<think>\n"
             # dies after one token otherwise.
-            stream = await client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                n=num_samples,
-                max_tokens=max_new_tokens if max_new_tokens else NOT_GIVEN,
-                stream=True,
-                extra_body=extra_body or None,
-                **standard,
+            stream = await self._open_stream(
+                client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    n=num_samples,
+                    max_tokens=max_new_tokens if max_new_tokens else NOT_GIVEN,
+                    stream=True,
+                    timeout=self._stream_timeout(),
+                    extra_body=extra_body or None,
+                    **standard,
+                )
             )
-            return await _collect_chat_stream(stream, num_samples)
+            return await _collect_chat_stream(stream, num_samples, progress=self._clock(), stall_s=self._stall_s())
 
         return await self._request(call, label="chat completion")
 
@@ -437,17 +552,20 @@ class VLLMOpenAIClient(LightevalModel):
             extra_body["truncate_prompt_tokens"] = prompt_room
 
         async def call():
-            stream = await client.completions.create(
-                model=self.model,
-                prompt=prompt,
-                n=num_samples,
-                max_tokens=max_new_tokens if max_new_tokens else NOT_GIVEN,
-                stop=self._stop_for(stop) or NOT_GIVEN,
-                stream=True,
-                extra_body=extra_body or None,
-                **standard,
+            stream = await self._open_stream(
+                client.completions.create(
+                    model=self.model,
+                    prompt=prompt,
+                    n=num_samples,
+                    max_tokens=max_new_tokens if max_new_tokens else NOT_GIVEN,
+                    stop=self._stop_for(stop) or NOT_GIVEN,
+                    stream=True,
+                    timeout=self._stream_timeout(),
+                    extra_body=extra_body or None,
+                    **standard,
+                )
             )
-            return await _collect_text_stream(stream, num_samples)
+            return await _collect_text_stream(stream, num_samples, progress=self._clock(), stall_s=self._stall_s())
 
         return await self._request(call, label="text completion")
 

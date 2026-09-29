@@ -38,7 +38,12 @@ import openai
 import pytest
 from test_openai_scoring import make_prompt_logprobs_payload
 
-from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIClient, VLLMOpenAIModelConfig
+from lighteval.models.endpoints.vllm_openai_model import (
+    VLLMOpenAIClient,
+    VLLMOpenAIModelConfig,
+    _collect_chat_stream,
+    _ProgressClock,
+)
 from lighteval.models.model_input import GenerationParameters
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.prompt_manager import PromptManager
@@ -548,6 +553,146 @@ class TestStreamedGeneration:
         sdk.completions.create = AsyncMock(return_value=make_sdk_completion_stream(["ok"]))
         run(client._call_api_text_generative(sdk, "p", 8, 1, None, prompt_room=5))
         assert sdk.completions.create.call_args.kwargs["extra_body"]["truncate_prompt_tokens"] == 5
+
+
+# ---------------------------------------------------------------------------
+# 3b'. Stall detection: queued behind others is not stuck
+# ---------------------------------------------------------------------------
+
+
+def _chat_chunk(piece):
+    delta = SimpleNamespace(content=piece, reasoning_content=None)
+    return SimpleNamespace(choices=[SimpleNamespace(index=0, finish_reason=None, delta=delta)])
+
+
+# A generating stream: a chunk every `delay` seconds, then opens `gate` for the requests queued behind it.
+async def _busy_stream(gate, chunks=12, delay=0.05):
+    for _ in range(chunks):
+        await asyncio.sleep(delay)
+        yield _chat_chunk("x")
+    gate.set()
+
+
+# A request the server has accepted but not scheduled: silent until `gate` opens.
+async def _queued_stream(gate, piece="late"):
+    await gate.wait()
+    yield _chat_chunk(piece)
+
+
+class TestStallDetection:
+    STALL_S = 0.3
+
+    def collect(self, stream, progress):
+        return _collect_chat_stream(stream, 1, progress=progress, stall_s=self.STALL_S)
+
+    def test_a_queued_request_waits_while_other_streams_progress(self):
+        async def scenario():
+            progress, gate = _ProgressClock(), asyncio.Event()
+            started = asyncio.get_running_loop().time()
+            busy, queued = await asyncio.gather(
+                self.collect(_busy_stream(gate), progress), self.collect(_queued_stream(gate), progress)
+            )
+            return queued, asyncio.get_running_loop().time() - started
+
+        queued, waited = run(scenario())
+        assert queued.choices[0].message.content == "late"
+        assert waited > 2 * self.STALL_S  # it waited far longer than the stall bound and was not stalled
+
+    def test_a_queued_request_stalls_when_no_stream_progresses(self):
+        with pytest.raises(openai.APITimeoutError, match="any stream"):
+            run(self.collect(_queued_stream(asyncio.Event()), _ProgressClock()))
+
+    def test_a_started_stream_stalls_on_its_own_gap_while_others_progress(self):
+        async def stuck():
+            yield _chat_chunk("first")
+            await asyncio.sleep(30)
+
+        async def scenario():
+            progress, gate = _ProgressClock(), asyncio.Event()
+            return await asyncio.gather(
+                self.collect(stuck(), progress),
+                self.collect(_busy_stream(gate, chunks=20), progress),
+                return_exceptions=True,
+            )
+
+        stalled, busy = run(scenario())
+        assert isinstance(stalled, openai.APITimeoutError) and "this stream" in str(stalled)
+        assert busy.choices[0].message.content == "x" * 20
+
+    def test_a_stalled_stream_is_closed(self):
+        class Hanging:
+            closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(30)
+
+            async def close(self):
+                self.closed = True
+
+        stream = Hanging()
+        with pytest.raises(openai.APITimeoutError):
+            run(self.collect(stream, _ProgressClock()))
+        assert stream.closed
+
+    def test_opening_a_stream_stalls_when_no_stream_progresses(self):
+        client = make_client()
+        client.timeout = 0.2
+        sdk = MagicMock()
+
+        async def never_opens(**kwargs):
+            await asyncio.sleep(30)
+
+        sdk.chat.completions.create = never_opens
+        assert run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1)) is None
+        assert client._consecutive_stalls == 1
+
+    def test_opening_a_stream_waits_while_other_streams_progress(self):
+        client = make_client()
+        client.timeout = 0.2
+        sdk = MagicMock()
+
+        async def opens_late(**kwargs):
+            await asyncio.sleep(0.6)
+            return make_sdk_chat_stream(["ok"])
+
+        sdk.chat.completions.create = opens_late
+
+        async def scenario():
+            async def elsewhere():  # another stream receiving chunks meanwhile
+                for _ in range(14):
+                    await asyncio.sleep(0.05)
+                    client._clock().tick()
+
+            response, _ = await asyncio.gather(
+                client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1), elsewhere()
+            )
+            return response
+
+        assert run(scenario()).choices[0].message.content == "ok"
+        assert client._consecutive_stalls == 0
+
+    def test_streamed_calls_have_no_sdk_read_timeout(self):
+        client = make_client(use_chat_template=True)
+        client.timeout = 42.0
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["ok"]))
+        sdk.completions.create = AsyncMock(return_value=make_sdk_completion_stream(["ok"]))
+        run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1))
+        run(client._call_api_text_generative(sdk, "Q", 8, 1, None))
+        for create in (sdk.chat.completions.create, sdk.completions.create):
+            timeout = create.call_args.kwargs["timeout"]
+            assert isinstance(timeout, httpx.Timeout) and timeout.read is None and timeout.connect == 42.0
+
+    def test_an_httpx_timeout_is_a_stall_not_a_crash(self):
+        client = make_client()
+        timed_out = AsyncMock(side_effect=httpx.ReadTimeout("no bytes"))
+        for _ in range(7):
+            assert run(client._request(timed_out, label="test")) is None
+        with pytest.raises(RuntimeError, match="stalled on 8 consecutive"):
+            run(client._request(timed_out, label="test"))
 
 
 # ---------------------------------------------------------------------------

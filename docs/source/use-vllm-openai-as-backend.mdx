@@ -55,10 +55,12 @@ Unlike generic OpenAI clients, vLLM-only sampling parameters
 `chat_template_kwargs` reaches the server's template rendering (e.g. Qwen's
 `enable_thinking` switch).
 
-Generations are streamed, so `timeout` bounds the gap between two chunks
-(including the wait before the first one: server queueing plus prefill), never
-the length of the whole generation — a 32k-token answer needs no special
-timeout. Retry behavior is tuned for a local server: connection failures abort
+Generations are streamed, so `timeout` is never the length of a generation —
+a 32k-token answer needs no special timeout. A request that has started stalls
+when its own chunks stop for `timeout`; a request still queued behind others
+(server queueing plus prefill) stalls only when no stream at all has received
+a chunk for `timeout`, so a busy server is never mistaken for a dead one,
+however long the queue. Retry behavior is tuned for a local server: connection failures abort
 quickly (the server is supposed to be up), a stalled stream is not retried
 (the request degrades to an empty result; eight consecutive stalls abort the
 run as a dead server), transient overload (429/5xx) backs off exponentially,
