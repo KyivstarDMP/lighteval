@@ -361,6 +361,25 @@ async def _collect_text_stream(
     )
 
 
+def _fit_open_files(connections: int) -> None:
+    """Raise the soft open-files limit to fit ``connections`` sockets: containers commonly start it at 1024."""
+    try:
+        import resource
+    except ImportError:  # no such limit on Windows
+        return
+    wanted = connections + 1024  # headroom for the process's own files
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft == resource.RLIM_INFINITY or soft >= wanted:
+        return
+    target = wanted if hard == resource.RLIM_INFINITY else min(wanted, hard)
+    resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    if target < wanted:
+        logger.warning(
+            f"The open-files limit ({hard}) cannot fit {connections} connections: "
+            f"requests past ~{target - 1024} in flight will fail to connect"
+        )
+
+
 class VLLMOpenAIModelConfig(ModelConfig):
     """Configuration for a vLLM OpenAI-compatible server client.
 
@@ -534,6 +553,7 @@ class VLLMOpenAIClient(LightevalModel):
         Its connection pool holds ``concurrent_requests``: past the SDK's default of 1000, requests queue inside
         httpx, whose pool handling grows costlier with the queue until it starves the event loop.
         """
+        _fit_open_files(self.concurrent_requests)
         limits = httpx.Limits(
             max_connections=self.concurrent_requests, max_keepalive_connections=self.concurrent_requests
         )

@@ -29,6 +29,7 @@ docs), config parsing and the cache-key exclusion of operational fields.
 """
 
 import asyncio
+import resource
 import tempfile
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -43,6 +44,7 @@ from lighteval.models.endpoints.vllm_openai_model import (
     VLLMOpenAIModelConfig,
     _AdaptiveLimiter,
     _collect_chat_stream,
+    _fit_open_files,
     _metrics_url,
     _next_limit,
     _parse_server_load,
@@ -1523,3 +1525,29 @@ def test_the_connection_pool_holds_every_request_in_flight():
         client._make_client()
     limits = http_client.call_args.kwargs["limits"]
     assert (limits.max_connections, limits.max_keepalive_connections) == (2048, 2048)
+
+
+def test_the_open_files_limit_fits_every_connection(monkeypatch):
+    # 2026-09-29: a worker container's soft limit of 1024 failed every connect past ~1000 in flight (EMFILE).
+    limit = {"nofile": (1024, 524288)}
+    monkeypatch.setattr(resource, "getrlimit", lambda _: limit["nofile"])
+    monkeypatch.setattr(resource, "setrlimit", lambda _, value: limit.update(nofile=value))
+    client = make_client()
+    client.concurrent_requests = 8192
+    client._make_client()
+    assert limit["nofile"] == (8192 + 1024, 524288)
+
+
+@pytest.mark.parametrize(
+    "limit, expected, warns",
+    [((65536, 524288), (65536, 524288), False), ((1024, 2048), (2048, 2048), True)],
+    ids=["already-fits", "hard-limit-too-low"],
+)
+def test_the_open_files_limit_is_only_raised_up_to_the_hard_limit(monkeypatch, caplog, limit, expected, warns):
+    current = {"nofile": limit}
+    monkeypatch.setattr(resource, "getrlimit", lambda _: current["nofile"])
+    monkeypatch.setattr(resource, "setrlimit", lambda _, value: current.update(nofile=value))
+    with caplog.at_level("WARNING"):
+        _fit_open_files(4096)
+    assert current["nofile"] == expected
+    assert any("cannot fit 4096 connections" in record.message for record in caplog.records) is warns
