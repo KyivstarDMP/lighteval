@@ -42,6 +42,7 @@ model_parameters:
     base_url: "http://localhost:8000/v1" # required
     use_chat_template: true              # false for base models
     concurrent_requests: 64
+    adaptive_concurrency: false          # true: concurrent_requests becomes a ceiling that follows the server's load
     timeout: 600                        # stall bound between streamed chunks, not a generation length
     max_model_length: 32768              # probed from /models when unset
     chat_template_kwargs:                # forwarded to the server's template
@@ -60,7 +61,20 @@ a 32k-token answer needs no special timeout. A request that has started stalls
 when its own chunks stop for `timeout`; a request still queued behind others
 (server queueing plus prefill) stalls only when no stream at all has received
 a chunk for `timeout`, so a busy server is never mistaken for a dead one,
-however long the queue. Retry behavior is tuned for a local server: connection failures abort
+however long the queue.
+
+`concurrent_requests` is a fixed number of requests in flight. With
+`adaptive_concurrency: true` it becomes a ceiling: generation starts at 64 in
+flight and follows the server's load from `/metrics` (vLLM only). It grows
+while the server takes everything offered with KV cache to spare, and sheds
+below what the server is running once its KV cache is nearly exhausted or it
+preempts. Use it for KV-bound models or generations that can run to the token
+cap, where a fixed number either leaves the GPU idle or thrashes the KV cache;
+leave it off for short answers, where the ramp-up is pure overhead. A server
+without `/metrics` is driven at the ceiling, and loglikelihood requests keep
+the fixed value.
+
+Retry behavior is tuned for a local server: connection failures abort
 quickly (the server is supposed to be up), a stalled stream is not retried
 (the request degrades to an empty result; eight consecutive stalls abort the
 run as a dead server), transient overload (429/5xx) backs off exponentially,

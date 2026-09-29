@@ -42,9 +42,12 @@ and, when exhausted, degrades that one request.
 import asyncio
 import contextlib
 import logging
+import re
 import time
+from collections import deque
+from collections.abc import Awaitable, Callable
 from types import SimpleNamespace
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import httpx
 import openai
@@ -74,6 +77,13 @@ _CONNECT_RETRY_SLEEP_S = 1.0
 _STALL_ABORT_AFTER = 8
 _DEFAULT_MAX_LENGTH = 4096
 _DEFAULT_STALL_S = 600.0  # the stall bound when the config leaves `timeout` unset
+
+# Adaptive concurrency: how the in-flight limit follows the server's load.
+_LOAD_INTERVAL_S = 2.0
+_START_CONCURRENCY = 64
+_KV_GROW_BELOW = 0.85  # grow only while the KV cache has room; between this and _KV_SHED_AT, hold
+_KV_SHED_AT = 0.95
+_SHED_TO = 0.9  # shed to this fraction of what the server is running
 
 
 class _ProgressClock:
@@ -147,6 +157,134 @@ async def _stream_chunks(stream, *, progress: _ProgressClock, stall_s: float):
         if closer is not None:
             with contextlib.suppress(Exception):
                 await closer()
+
+
+class _ServerLoad(NamedTuple):
+    running: float
+    waiting: float
+    kv_usage: float
+    preemptions: float  # cumulative
+
+
+_LOAD_SERIES = {
+    "vllm:num_requests_running": "running",
+    "vllm:num_requests_waiting": "waiting",
+    "vllm:kv_cache_usage_perc": "kv_usage",
+    "vllm:num_preemptions_total": "preemptions",
+}
+_SERIES_LINE = re.compile(r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{[^}]*\})?\s+(?P<value>\S+)")
+
+
+def _metrics_url(base_url: str) -> str:
+    return base_url.rstrip("/").removesuffix("/v1") + "/metrics"
+
+
+def _parse_server_load(text: str) -> _ServerLoad | None:
+    """Read the series the limiter steers by from a Prometheus exposition; ``None`` if the server lacks any of them.
+
+    Several engines (data parallel) add up, except the KV usage, where the fullest one counts.
+    """
+    totals: dict[str, float] = {}
+    for line in text.splitlines():
+        match = _SERIES_LINE.match(line)
+        if match is None or (field := _LOAD_SERIES.get(match["name"])) is None:
+            continue
+        try:
+            value = float(match["value"])
+        except ValueError:
+            continue
+        totals[field] = max(totals.get(field, 0.0), value) if field == "kv_usage" else totals.get(field, 0.0) + value
+    return _ServerLoad(**totals) if len(totals) == len(_LOAD_SERIES) else None
+
+
+def _next_limit(limit: int, *, ceiling: int, in_flight: int, load: _ServerLoad, preempted: float) -> int:
+    """One control step.
+
+    Shed below what the server is running once its KV cache is exhausted or it just preempted; grow while it takes
+    everything offered with KV to spare; otherwise hold.
+    """
+    if load.kv_usage >= _KV_SHED_AT or preempted > 0:
+        return max(1, min(limit, int(load.running * _SHED_TO)))
+    if load.waiting == 0 and load.kv_usage < _KV_GROW_BELOW and in_flight >= 0.9 * limit:
+        return min(ceiling, limit + max(1, limit // 2))
+    return limit
+
+
+class _AdaptiveLimiter:
+    """An in-flight gate with a movable limit, used like a semaphore (``async with``); waiters are served in order.
+
+    Lowering the limit evicts nothing: requests already in flight finish, and new ones wait until there is room.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.in_flight = 0
+        self._waiters: deque[asyncio.Future] = deque()
+
+    async def __aenter__(self) -> None:
+        if self.in_flight < self.limit and not self._waiters:
+            self.in_flight += 1
+            return
+        waiter = asyncio.get_running_loop().create_future()
+        self._waiters.append(waiter)
+        try:
+            await waiter  # `_wake` counts the slot before resolving it
+        except BaseException:
+            if waiter.done() and not waiter.cancelled():
+                self.in_flight -= 1  # granted a slot but cancelled before using it
+                self._wake()
+            else:
+                with contextlib.suppress(ValueError):
+                    self._waiters.remove(waiter)
+            raise
+
+    async def __aexit__(self, *exc_info) -> None:
+        self.in_flight -= 1
+        self._wake()
+
+    def set_limit(self, limit: int) -> None:
+        self.limit = limit
+        self._wake()
+
+    def _wake(self) -> None:
+        while self._waiters and self.in_flight < self.limit:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                self.in_flight += 1
+                waiter.set_result(None)
+
+
+async def _steer(
+    limiter: _AdaptiveLimiter,
+    *,
+    ceiling: int,
+    fetch: Callable[[], Awaitable[str | None]],
+    interval: float = _LOAD_INTERVAL_S,
+) -> None:
+    """Move ``limiter`` with the server's load until cancelled; a server that reports none is driven at the ceiling."""
+    last_preemptions: float | None = None
+    warned = False
+    while True:
+        await asyncio.sleep(interval)
+        text = await fetch()
+        load = _parse_server_load(text) if text else None
+        if load is None:
+            if not warned:
+                logger.warning(f"Adaptive concurrency: the server reports no load; sending up to {ceiling} in flight.")
+                warned = True
+            limiter.set_limit(ceiling)
+            continue
+        preempted = 0.0 if last_preemptions is None else max(0.0, load.preemptions - last_preemptions)
+        last_preemptions = load.preemptions
+        limit = _next_limit(
+            limiter.limit, ceiling=ceiling, in_flight=limiter.in_flight, load=load, preempted=preempted
+        )
+        if limit != limiter.limit:
+            logger.info(
+                f"Adaptive concurrency {limiter.limit} -> {limit} (server running={load.running:.0f} "
+                f"waiting={load.waiting:.0f} kv={load.kv_usage:.0%} preempted={preempted:.0f})"
+            )
+            limiter.set_limit(limit)
 
 
 async def _collect_chat_stream(
@@ -228,6 +366,14 @@ class VLLMOpenAIModelConfig(ModelConfig):
             ``/v1/completions`` for both generation and loglikelihood.
         concurrent_requests (int):
             Client-side request concurrency. Default 10.
+        adaptive_concurrency (bool):
+            Off by default. When on, ``concurrent_requests`` is only a ceiling:
+            generation starts at 64 in flight and follows the server's own load
+            (``/metrics``) — it grows while the server takes everything offered
+            with KV cache to spare, and sheds below what the server is running
+            once its KV cache is exhausted or it preempts, so a KV-bound model
+            is not over-admitted. A server without ``/metrics`` is driven at
+            the ceiling. Loglikelihood requests keep the static concurrency.
         timeout (float | None):
             Stall bound in seconds (600 when unset). Generations are streamed,
             so it is never the length of a generation: a request that has
@@ -288,6 +434,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
     api_key: str | None = None
     use_chat_template: bool = True
     concurrent_requests: int = 10
+    adaptive_concurrency: bool = False
     timeout: float | None = None
     max_model_length: int | None = None
 
@@ -309,6 +456,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
             "tokenizer",
             "trust_remote_code",
             "concurrent_requests",
+            "adaptive_concurrency",
             "timeout",
             "api_max_retry",
             "api_retry_sleep",
@@ -320,6 +468,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
 class VLLMOpenAIClient(LightevalModel):
     _consecutive_stalls = 0  # reset by any completed request
     _progress: _ProgressClock | None = None
+    adaptive_concurrency = False
     # Client-side tokenization state (class defaults so tests can build instances without __init__).
     client_tokenization = True
     pairwise_tokenization = False
@@ -336,6 +485,7 @@ class VLLMOpenAIClient(LightevalModel):
         self.api_key = config.api_key
         self.generation_parameters = config.generation_parameters
         self.concurrent_requests = config.concurrent_requests
+        self.adaptive_concurrency = config.adaptive_concurrency
         self.timeout = config.timeout
         self._max_length = config.max_model_length
         self._context_budget = config.max_model_length
@@ -372,6 +522,32 @@ class VLLMOpenAIClient(LightevalModel):
             timeout=self.timeout if self.timeout is not None else NOT_GIVEN,
             max_retries=0,  # retry classification is ours, not the SDK's
         )
+
+    async def _fetch_load(self) -> str | None:
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as http:
+                return (await http.get(_metrics_url(self.base_url))).text
+        except httpx.HTTPError:
+            return None
+
+    @contextlib.asynccontextmanager
+    async def _gate(self):
+        """The in-flight gate for one generation run.
+
+        Yields:
+            A semaphore, or a limiter steered by the server's load when ``adaptive_concurrency`` is on.
+        """
+        if not self.adaptive_concurrency:
+            yield asyncio.Semaphore(self.concurrent_requests)
+            return
+        limiter = _AdaptiveLimiter(min(self.concurrent_requests, _START_CONCURRENCY))
+        steering = asyncio.create_task(_steer(limiter, ceiling=self.concurrent_requests, fetch=self._fetch_load))
+        try:
+            yield limiter
+        finally:
+            steering.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await steering
 
     def _clock(self) -> _ProgressClock:
         if self._progress is None:
@@ -576,9 +752,7 @@ class VLLMOpenAIClient(LightevalModel):
 
         async def process_splits() -> list[ModelResponse]:
             results = []
-            async with self._make_client() as client:
-                semaphore = asyncio.Semaphore(self.concurrent_requests)
-
+            async with self._make_client() as client, self._gate() as semaphore:
                 for split in tqdm(
                     dataset.splits_iterator(),
                     total=dataset.num_dataset_splits,

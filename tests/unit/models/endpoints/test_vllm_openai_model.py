@@ -41,8 +41,14 @@ from test_openai_scoring import make_prompt_logprobs_payload
 from lighteval.models.endpoints.vllm_openai_model import (
     VLLMOpenAIClient,
     VLLMOpenAIModelConfig,
+    _AdaptiveLimiter,
     _collect_chat_stream,
+    _metrics_url,
+    _next_limit,
+    _parse_server_load,
     _ProgressClock,
+    _ServerLoad,
+    _steer,
 )
 from lighteval.models.model_input import GenerationParameters
 from lighteval.models.model_output import ModelResponse
@@ -693,6 +699,285 @@ class TestStallDetection:
             assert run(client._request(timed_out, label="test")) is None
         with pytest.raises(RuntimeError, match="stalled on 8 consecutive"):
             run(client._request(timed_out, label="test"))
+
+
+# ---------------------------------------------------------------------------
+# 3b''. Adaptive concurrency
+# ---------------------------------------------------------------------------
+
+METRICS_SAMPLE = """\
+# HELP vllm:num_requests_running Number of requests in model execution batches.
+# TYPE vllm:num_requests_running gauge
+vllm:num_requests_running{engine="0",model_name="org/m"} 11.0
+# TYPE vllm:num_requests_waiting gauge
+vllm:num_requests_waiting{engine="0",model_name="org/m"} 719.0
+vllm:num_requests_waiting_by_reason{engine="0",model_name="org/m",reason="capacity"} 719.0
+vllm:kv_cache_usage_perc{engine="0",model_name="org/m"} 0.231717933836332
+# TYPE vllm:num_preemptions_total counter
+vllm:num_preemptions_total{engine="0",model_name="org/m"} 353.0
+"""
+
+
+def _load(running=100, waiting=0, kv=0.5, preemptions=0.0):
+    return _ServerLoad(running=running, waiting=waiting, kv_usage=kv, preemptions=preemptions)
+
+
+class TestServerLoad:
+    def test_reads_the_series_the_limiter_steers_by(self):
+        assert _parse_server_load(METRICS_SAMPLE) == _ServerLoad(
+            running=11.0, waiting=719.0, kv_usage=0.231717933836332, preemptions=353.0
+        )  # `waiting_by_reason` is a different series and is not added to `waiting`
+
+    def test_engines_add_up_and_the_fullest_kv_cache_counts(self):
+        two = METRICS_SAMPLE + (
+            'vllm:num_requests_running{engine="1",model_name="org/m"} 4.0\n'
+            'vllm:num_requests_waiting{engine="1",model_name="org/m"} 1.0\n'
+            'vllm:kv_cache_usage_perc{engine="1",model_name="org/m"} 0.9\n'
+            'vllm:num_preemptions_total{engine="1",model_name="org/m"} 2.0\n'
+        )
+        assert _parse_server_load(two) == _ServerLoad(running=15.0, waiting=720.0, kv_usage=0.9, preemptions=355.0)
+
+    def test_a_server_missing_a_series_reports_no_load(self):
+        assert _parse_server_load(METRICS_SAMPLE.replace("vllm:kv_cache_usage_perc", "vllm:other")) is None
+        assert _parse_server_load("") is None
+
+    def test_metrics_live_at_the_server_root(self):
+        assert _metrics_url("http://localhost:8000/v1") == "http://localhost:8000/metrics"
+        assert _metrics_url("http://localhost:8000/v1/") == "http://localhost:8000/metrics"
+
+
+class TestNextLimit:
+    @pytest.mark.parametrize(
+        ("limit", "in_flight", "load", "preempted", "expected"),
+        [
+            pytest.param(64, 64, _load(kv=0.3), 0, 96, id="grows_while_the_server_takes_everything"),
+            pytest.param(900, 900, _load(kv=0.3), 0, 1000, id="growth_stops_at_the_ceiling"),
+            pytest.param(64, 10, _load(kv=0.3), 0, 64, id="holds_when_the_client_is_not_saturating_its_limit"),
+            pytest.param(64, 64, _load(waiting=5, kv=0.3), 0, 64, id="holds_while_requests_wait_at_the_server"),
+            pytest.param(64, 64, _load(kv=0.9), 0, 64, id="holds_in_the_band_between_grow_and_shed"),
+            pytest.param(300, 300, _load(running=120, kv=0.97), 0, 108, id="sheds_below_what_the_server_runs"),
+            pytest.param(300, 300, _load(running=200, kv=0.5), 3, 180, id="sheds_on_preemption_even_with_kv_to_spare"),
+            pytest.param(50, 50, _load(running=200, kv=0.99), 0, 50, id="never_raises_the_limit_when_shedding"),
+            pytest.param(50, 50, _load(running=0, kv=0.99), 0, 1, id="never_sheds_below_one"),
+        ],
+    )
+    def test_control_step(self, limit, in_flight, load, preempted, expected):
+        assert _next_limit(limit, ceiling=1000, in_flight=in_flight, load=load, preempted=preempted) == expected
+
+
+class TestAdaptiveLimiter:
+    def test_waiters_are_served_in_order_and_never_exceed_the_limit(self):
+        async def scenario():
+            limiter, order, peak = _AdaptiveLimiter(2), [], 0
+
+            async def worker(name):
+                nonlocal peak
+                async with limiter:
+                    peak = max(peak, limiter.in_flight)
+                    order.append(name)
+                    await asyncio.sleep(0.01)
+
+            await asyncio.gather(*[worker(i) for i in range(6)])
+            return order, peak, limiter.in_flight
+
+        order, peak, left = run(scenario())
+        assert order == [0, 1, 2, 3, 4, 5] and peak == 2 and left == 0
+
+    def test_raising_the_limit_admits_waiters_at_once(self):
+        async def scenario():
+            limiter, gate, entered = _AdaptiveLimiter(1), asyncio.Event(), []
+
+            async def worker(name):
+                async with limiter:
+                    entered.append(name)
+                    await gate.wait()
+
+            tasks = [asyncio.create_task(worker(i)) for i in range(3)]
+            await asyncio.sleep(0.02)
+            before = list(entered)
+            limiter.set_limit(3)
+            await asyncio.sleep(0.02)
+            after = list(entered)
+            gate.set()
+            await asyncio.gather(*tasks)
+            return before, after
+
+        assert run(scenario()) == ([0], [0, 1, 2])
+
+    def test_lowering_the_limit_evicts_nothing_and_holds_back_new_requests(self):
+        async def scenario():
+            limiter, gate, entered = _AdaptiveLimiter(3), asyncio.Event(), []
+
+            async def worker(name):
+                async with limiter:
+                    entered.append(name)
+                    await gate.wait()
+
+            first = [asyncio.create_task(worker(i)) for i in range(3)]
+            await asyncio.sleep(0.02)
+            limiter.set_limit(1)
+            late = asyncio.create_task(worker("late"))
+            await asyncio.sleep(0.02)
+            held = (limiter.in_flight, list(entered))
+            gate.set()
+            await asyncio.gather(*first, late)
+            return held, entered
+
+        (in_flight, entered_while_held), entered = run(scenario())
+        assert in_flight == 3 and entered_while_held == [0, 1, 2]  # nothing evicted, "late" waits for room
+        assert entered[-1] == "late"
+
+    def test_a_cancelled_waiter_leaves_no_slot_behind(self):
+        async def scenario():
+            limiter = _AdaptiveLimiter(1)
+            await limiter.__aenter__()
+            waiter = asyncio.create_task(limiter.__aenter__())
+            await asyncio.sleep(0.01)
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+            await limiter.__aexit__(None, None, None)
+            await asyncio.wait_for(limiter.__aenter__(), 1)  # the slot is free again
+            return limiter.in_flight, len(limiter._waiters)
+
+        assert run(scenario()) == (1, 0)
+
+    def test_a_waiter_cancelled_after_being_granted_gives_the_slot_back(self):
+        async def scenario():
+            limiter = _AdaptiveLimiter(1)
+            await limiter.__aenter__()
+            waiter = asyncio.create_task(limiter.__aenter__())
+            await asyncio.sleep(0.01)
+            await limiter.__aexit__(None, None, None)  # grants the slot to the waiter...
+            waiter.cancel()  # ...which is cancelled before it resumes
+            await asyncio.gather(waiter, return_exceptions=True)
+            return limiter.in_flight
+
+        assert run(scenario()) == 0
+
+
+def _fake_fetch(*texts):
+    """A metrics fetcher returning ``texts`` in turn, then hanging like an idle poll."""
+    calls = []
+
+    async def fetch():
+        calls.append(1)
+        if len(calls) > len(texts):
+            await asyncio.sleep(30)
+        return texts[len(calls) - 1]
+
+    return fetch, calls
+
+
+def _series(running=100, waiting=0, kv=0.5, preemptions=0):
+    return (
+        f"vllm:num_requests_running {running}\nvllm:num_requests_waiting {waiting}\n"
+        f"vllm:kv_cache_usage_perc {kv}\nvllm:num_preemptions_total {preemptions}\n"
+    )
+
+
+async def _steer_through(limiter, ceiling, *texts):
+    fetch, calls = _fake_fetch(*texts)
+    limits = []
+
+    async def recording_fetch():
+        limits.append(limiter.limit)
+        limiter.in_flight = limiter.limit  # the client keeps its limit full
+        return await fetch()
+
+    task = asyncio.create_task(_steer(limiter, ceiling=ceiling, fetch=recording_fetch, interval=0.005))
+    while len(calls) < len(texts):
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.02)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    return limits
+
+
+class TestSteering:
+    def test_ramps_up_on_an_idle_server_and_stops_at_the_ceiling(self):
+        limiter = _AdaptiveLimiter(64)
+        limits = run(_steer_through(limiter, 200, *[_series(kv=0.1)] * 5))
+        assert limits[:4] == [64, 96, 144, 200] and limiter.limit == 200
+
+    def test_sheds_when_the_kv_cache_is_exhausted(self):
+        limiter = _AdaptiveLimiter(300)
+        run(_steer_through(limiter, 1000, _series(running=120, kv=0.97)))
+        assert limiter.limit == 108
+
+    def test_preemptions_before_the_first_reading_are_not_new_ones(self):
+        limiter = _AdaptiveLimiter(300)
+        limits = run(_steer_through(limiter, 1000, _series(running=200, preemptions=5)))
+        assert limits[0] == 300 and limiter.limit == 450  # it grew instead of shedding
+
+    def test_sheds_on_a_new_preemption(self):
+        limiter = _AdaptiveLimiter(300)
+        run(_steer_through(limiter, 1000, _series(running=200, preemptions=5), _series(running=200, preemptions=7)))
+        assert limiter.limit == 180  # 90 % of the 200 running
+
+    def test_a_server_without_metrics_is_driven_at_the_ceiling(self, caplog):
+        limiter = _AdaptiveLimiter(64)
+        with caplog.at_level("WARNING"):
+            run(_steer_through(limiter, 500, None, None))
+        assert limiter.limit == 500
+        assert sum("reports no load" in record.message for record in caplog.records) == 1
+
+    def test_gate_is_a_plain_semaphore_unless_adaptive(self):
+        async def scenario(adaptive):
+            client = make_client()
+            client.adaptive_concurrency = adaptive
+            client._fetch_load = AsyncMock(return_value=None)
+            async with client._gate() as gate:
+                return type(gate)
+
+        assert run(scenario(False)) is asyncio.Semaphore
+        assert run(scenario(True)) is _AdaptiveLimiter
+
+    def test_the_adaptive_gate_starts_low_under_the_ceiling_and_stops_steering_on_exit(self):
+        async def scenario():
+            client = make_client()
+            client.adaptive_concurrency = True
+            client.concurrent_requests = 1024
+            client._fetch_load = AsyncMock(return_value=None)
+            async with client._gate() as gate:
+                start = gate.limit
+            leftover = [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]
+            return start, leftover
+
+        assert run(scenario()) == (64, [])
+
+    def test_a_small_ceiling_is_never_exceeded_at_the_start(self):
+        async def scenario():
+            client = make_client()
+            client.adaptive_concurrency = True
+            client.concurrent_requests = 11
+            client._fetch_load = AsyncMock(return_value=None)
+            async with client._gate() as gate:
+                return gate.limit
+
+        assert run(scenario()) == 11
+
+    def test_greedy_until_runs_through_the_adaptive_gate(self):
+        client = make_client()
+        client.adaptive_concurrency = True
+        client._fetch_load = AsyncMock(return_value=None)
+        doc = Doc(query="Q?", choices=[], gold_index=0, task_name="t", generation_size=8)
+        doc.id = "0"
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["fin", "al"]))
+        sdk.__aenter__ = AsyncMock(return_value=sdk)
+        sdk.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            (result,) = client.greedy_until([doc])
+        assert result.text == ["final"]
+
+    def test_the_option_is_off_by_default_and_not_part_of_the_cache_key(self):
+        assert VLLMOpenAIModelConfig(model_name="org/m", base_url="http://x/v1").adaptive_concurrency is False
+        with tempfile.TemporaryDirectory() as temp_dir:
+            a = VLLMOpenAIModelConfig(model_name="org/m", base_url="http://x/v1", cache_dir=temp_dir)
+            b = VLLMOpenAIModelConfig(
+                model_name="org/m", base_url="http://x/v1", adaptive_concurrency=True, cache_dir=temp_dir
+            )
+            assert SampleCache(a).get_model_hash(a) == SampleCache(b).get_model_hash(b)
 
 
 # ---------------------------------------------------------------------------
