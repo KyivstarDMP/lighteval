@@ -751,14 +751,27 @@ class TestNextLimit:
         ("limit", "in_flight", "load", "preempted", "expected"),
         [
             pytest.param(64, 64, _load(kv=0.3), 0, 96, id="grows_while_the_server_takes_everything"),
-            pytest.param(900, 900, _load(kv=0.3), 0, 1000, id="growth_stops_at_the_ceiling"),
+            pytest.param(900, 900, _load(running=900, kv=0.3), 0, 1000, id="growth_stops_at_the_ceiling"),
+            pytest.param(
+                64, 64, _load(running=58, kv=0.3), 0, 96, id="grows_once_the_server_runs_nearly_all_in_flight"
+            ),
+            pytest.param(
+                64, 64, _load(running=0, kv=0.0), 0, 64, id="holds_while_what_was_sent_has_not_been_scheduled"
+            ),
+            pytest.param(100, 100, _load(running=85, kv=0.3), 0, 100, id="holds_while_a_tenth_is_still_in_transit"),
+            pytest.param(14, 14, _load(running=14, kv=0.5), 0, 21, id="regrows_after_a_shed_once_kv_frees_up"),
             pytest.param(64, 10, _load(kv=0.3), 0, 64, id="holds_when_the_client_is_not_saturating_its_limit"),
             pytest.param(64, 64, _load(waiting=5, kv=0.3), 0, 64, id="holds_while_requests_wait_at_the_server"),
             pytest.param(64, 64, _load(kv=0.9), 0, 64, id="holds_in_the_band_between_grow_and_shed"),
-            pytest.param(300, 300, _load(running=120, kv=0.97), 0, 108, id="sheds_below_what_the_server_runs"),
+            pytest.param(100, 100, _load(running=80, kv=0.97), 0, 72, id="sheds_below_what_the_server_runs"),
+            pytest.param(300, 300, _load(running=120, kv=0.97), 0, 150, id="sheds_by_at_most_half"),
             pytest.param(300, 300, _load(running=200, kv=0.5), 3, 180, id="sheds_on_preemption_even_with_kv_to_spare"),
+            pytest.param(
+                50, 120, _load(running=40, kv=0.99), 4, 50, id="does_not_shed_again_before_a_shed_takes_effect"
+            ),
+            pytest.param(14, 100, _load(running=100, kv=0.5), 0, 14, id="does_not_grow_before_a_shed_takes_effect"),
             pytest.param(50, 50, _load(running=200, kv=0.99), 0, 50, id="never_raises_the_limit_when_shedding"),
-            pytest.param(50, 50, _load(running=0, kv=0.99), 0, 1, id="never_sheds_below_one"),
+            pytest.param(1, 1, _load(running=0, kv=0.99), 0, 1, id="never_sheds_below_one"),
         ],
     )
     def test_control_step(self, limit, in_flight, load, preempted, expected):
@@ -863,7 +876,8 @@ def _fake_fetch(*texts):
         calls.append(1)
         if len(calls) > len(texts):
             await asyncio.sleep(30)
-        return texts[len(calls) - 1]
+        item = texts[len(calls) - 1]
+        return item() if callable(item) else item  # a callable reads the state at fetch time
 
     return fetch, calls
 
@@ -894,20 +908,37 @@ async def _steer_through(limiter, ceiling, *texts):
 
 
 class TestSteering:
-    def test_ramps_up_on_an_idle_server_and_stops_at_the_ceiling(self):
+    def test_ramps_up_while_the_server_runs_what_is_sent_and_stops_at_the_ceiling(self):
         limiter = _AdaptiveLimiter(64)
-        limits = run(_steer_through(limiter, 200, *[_series(kv=0.1)] * 5))
+        server_runs_all = lambda: _series(running=limiter.limit, kv=0.1)  # noqa: E731
+        limits = run(_steer_through(limiter, 200, *[server_runs_all] * 5))
         assert limits[:4] == [64, 96, 144, 200] and limiter.limit == 200
+
+    def test_does_not_ramp_while_the_server_has_not_scheduled_what_was_sent(self):
+        # Requests still on their way to the scheduler are invisible to /metrics: no running, no waiting, no KV.
+        limiter = _AdaptiveLimiter(64)
+        limits = run(_steer_through(limiter, 1024, *[_series(running=0, kv=0.0)] * 6))
+        assert limiter.limit == 64 and set(limits) == {64}
+
+    def test_the_startup_of_the_eurollm_ifstruct_run_no_longer_overshoots(self):
+        # The readings the first live run steered by (2026-09-29, EuroLLM-22B, ifstruct, 2 s apart): the engine was
+        # still warming up, so /metrics showed nothing of the 64 requests already sent. That run went 64 -> 1024.
+        startup = [_series(running=0, waiting=0, kv=0.0)] * 7
+        # ...then the server caught up with what had been sent.
+        caught_up = [_series(running=64, waiting=0, kv=0.4)]
+        limiter = _AdaptiveLimiter(64)
+        limits = run(_steer_through(limiter, 1024, *startup, *caught_up))
+        assert set(limits[:8]) == {64} and limiter.limit == 96
 
     def test_sheds_when_the_kv_cache_is_exhausted(self):
         limiter = _AdaptiveLimiter(300)
         run(_steer_through(limiter, 1000, _series(running=120, kv=0.97)))
-        assert limiter.limit == 108
+        assert limiter.limit == 150  # 90 % of the 120 running would be 108, but a shed at most halves
 
     def test_preemptions_before_the_first_reading_are_not_new_ones(self):
         limiter = _AdaptiveLimiter(300)
         limits = run(_steer_through(limiter, 1000, _series(running=200, preemptions=5)))
-        assert limits[0] == 300 and limiter.limit == 450  # it grew instead of shedding
+        assert limits[0] == 300 and limiter.limit == 300  # held (200 of 300 seen), not shed for old preemptions
 
     def test_sheds_on_a_new_preemption(self):
         limiter = _AdaptiveLimiter(300)

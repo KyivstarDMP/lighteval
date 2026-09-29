@@ -84,6 +84,7 @@ _START_CONCURRENCY = 64
 _KV_GROW_BELOW = 0.85  # grow only while the KV cache has room; between this and _KV_SHED_AT, hold
 _KV_SHED_AT = 0.95
 _SHED_TO = 0.9  # shed to this fraction of what the server is running
+_SATURATED = 0.9  # "all" with slack: the client fills its limit, the server runs what is in flight
 
 
 class _ProgressClock:
@@ -200,12 +201,19 @@ def _parse_server_load(text: str) -> _ServerLoad | None:
 def _next_limit(limit: int, *, ceiling: int, in_flight: int, load: _ServerLoad, preempted: float) -> int:
     """One control step.
 
-    Shed below what the server is running once its KV cache is exhausted or it just preempted; grow while it takes
-    everything offered with KV to spare; otherwise hold.
+    Shed below what the server is running once its KV cache is exhausted or it just preempted, by at most half, and
+    not again until the last shed has taken effect (requests already sent keep running, and keep the server
+    preempting, until they finish). Grow only while the client fills its limit and the server is running what the
+    client has in flight, with KV to spare: requests the server has not scheduled yet are invisible to its metrics,
+    and a limiter cannot recall what it has sent. Otherwise hold.
     """
+    if in_flight > limit:
+        return limit
     if load.kv_usage >= _KV_SHED_AT or preempted > 0:
-        return max(1, min(limit, int(load.running * _SHED_TO)))
-    if load.waiting == 0 and load.kv_usage < _KV_GROW_BELOW and in_flight >= 0.9 * limit:
+        return max(1, min(limit, max(int(load.running * _SHED_TO), limit // 2)))
+    saturating = in_flight >= _SATURATED * limit
+    seen = load.waiting == 0 and load.running >= _SATURATED * in_flight
+    if saturating and seen and load.kv_usage < _KV_GROW_BELOW:
         return min(ceiling, limit + max(1, limit // 2))
     return limit
 
@@ -281,8 +289,8 @@ async def _steer(
         )
         if limit != limiter.limit:
             logger.info(
-                f"Adaptive concurrency {limiter.limit} -> {limit} (server running={load.running:.0f} "
-                f"waiting={load.waiting:.0f} kv={load.kv_usage:.0%} preempted={preempted:.0f})"
+                f"Adaptive concurrency {limiter.limit} -> {limit} (in flight={limiter.in_flight}; server "
+                f"running={load.running:.0f} waiting={load.waiting:.0f} kv={load.kv_usage:.0%} preempted={preempted:.0f})"
             )
             limiter.set_limit(limit)
 

@@ -66,9 +66,10 @@ however long the queue.
 `concurrent_requests` is a fixed number of requests in flight. With
 `adaptive_concurrency: true` it becomes a ceiling: generation starts at 64 in
 flight and follows the server's load from `/metrics` (vLLM only). It grows
-while the server takes everything offered with KV cache to spare, and sheds
-below what the server is running once its KV cache is nearly exhausted or it
-preempts. Use it for KV-bound models or generations that can run to the token
+while the server is running what the client has in flight, with KV cache to
+spare, and sheds below what the server is running — by at most half, and not
+again until the last shed has taken effect — once its KV cache is nearly
+exhausted or it preempts. Use it for KV-bound models or generations that can run to the token
 cap, where a fixed number either leaves the GPU idle or thrashes the KV cache;
 leave it off for short answers, where the ramp-up is pure overhead. A server
 without `/metrics` is driven at the ceiling, and loglikelihood requests keep
