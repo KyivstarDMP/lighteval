@@ -952,6 +952,14 @@ class TestSteering:
         assert limiter.limit == 500
         assert sum("reports no load" in record.message for record in caplog.records) == 1
 
+    def test_a_missed_reading_keeps_the_limit_once_the_server_has_reported(self, caplog):
+        # 2026-09-29: a /metrics fetch timed out under load and the limit jumped from 1639 to the 8192 ceiling.
+        limiter = _AdaptiveLimiter(300)
+        with caplog.at_level("WARNING"):
+            run(_steer_through(limiter, 8192, _series(running=100, waiting=5), None, None))
+        assert limiter.limit == 300
+        assert not any("reports no load" in record.message for record in caplog.records)
+
     def test_gate_is_a_plain_semaphore_unless_adaptive(self):
         async def scenario(adaptive):
             client = make_client()
@@ -1468,3 +1476,40 @@ class TestMaxLength:
 
         monkeypatch.setattr(httpx, "get", fake_get)
         assert client.max_length == 4096
+
+
+def _stream_error(message="Unexpected token 200002 while expecting start token 200006") -> openai.APIError:
+    return openai.APIError(
+        message, request=httpx.Request("POST", "http://localhost:8000/v1/chat/completions"), body=None
+    )
+
+
+class TestErrorsInsideAStream:
+    def test_an_error_inside_a_stream_is_retried_then_degraded(self):
+        client = make_client(api_max_retry=3)
+        call = AsyncMock(side_effect=_stream_error())
+        assert run(client._request(call, label="test")) is None
+        assert call.await_count >= 3  # the same bound as a 5xx
+
+    def test_an_error_inside_a_stream_is_retried_until_the_sample_succeeds(self):
+        client = make_client(api_max_retry=3)
+        good = make_sdk_chat_response()
+        call = AsyncMock(side_effect=[_stream_error(), good])
+        assert run(client._request(call, label="test")) is good
+
+    def test_a_generation_the_server_cannot_parse_degrades_only_that_request(self):
+        async def breaks_mid_stream():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(
+                        index=0, finish_reason=None, delta=SimpleNamespace(content="par", reasoning_content=None)
+                    )
+                ]
+            )
+            raise _stream_error()
+
+        client = make_client(api_max_retry=2)
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(side_effect=lambda **kwargs: breaks_mid_stream())
+        assert run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1)) is None
+        assert sdk.chat.completions.create.await_count >= 2

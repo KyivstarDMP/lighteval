@@ -269,7 +269,11 @@ async def _steer(
     fetch: Callable[[], Awaitable[str | None]],
     interval: float = _LOAD_INTERVAL_S,
 ) -> None:
-    """Move ``limiter`` with the server's load until cancelled; a server that reports none is driven at the ceiling."""
+    """Move ``limiter`` with the server's load until cancelled.
+
+    A server that has never reported its load is driven at the ceiling; one that did and now misses a reading (a
+    fetch that timed out under load, say) keeps the current limit.
+    """
     last_preemptions: float | None = None
     warned = False
     while True:
@@ -277,6 +281,8 @@ async def _steer(
         text = await fetch()
         load = _parse_server_load(text) if text else None
         if load is None:
+            if last_preemptions is not None:
+                continue
             if not warned:
                 logger.warning(f"Adaptive concurrency: the server reports no load; sending up to {ceiling} in flight.")
                 warned = True
@@ -593,8 +599,10 @@ class VLLMOpenAIClient(LightevalModel):
           resample of the same prompt stalls the same way — degrade this one
           request to ``None``; after ``_STALL_ABORT_AFTER`` consecutive stalls
           the server is dead, **raise**.
-        - 429 / 5xx (transient overload): exponential backoff up to
-          ``api_max_retry``, then degrade this one request to ``None``.
+        - 429 / 5xx (transient overload), and an error the server reports
+          inside a stream (a generation the server could not parse, say):
+          exponential backoff up to ``api_max_retry``, then degrade this one
+          request to ``None``.
         - Other 4xx (bad request, e.g. context overflow): no retry, degrade to
           ``None`` so one oversized doc doesn't abort a long run.
         """
@@ -629,6 +637,10 @@ class VLLMOpenAIClient(LightevalModel):
                 else:
                     logger.error(f"HTTP {e.status_code} on {label}: {e}. Not retrying; degrading this request.")
                     return None
+            except openai.APIError as e:
+                wait_time = self._backoff(attempt)
+                logger.warning(f"Server error in the {label} stream: {e} — retrying in {wait_time:.1f}s")
+                await asyncio.sleep(wait_time)
 
         logger.error(f"{label} failed after {self.API_MAX_RETRY} attempts; degrading this request.")
         return None
