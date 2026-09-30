@@ -1527,6 +1527,14 @@ def test_the_connection_pool_holds_every_request_in_flight():
     assert (limits.max_connections, limits.max_keepalive_connections) == (2048, 2048)
 
 
+def test_an_idle_connection_expires_before_the_server_closes_it():
+    # 2026-09-30: a pool of 1024 idle connections expiring at httpx's 5 s, the same as vLLM's keep-alive, reused
+    # connections the server had just closed; every loglikelihood run logged ReadErrors and one group aborted.
+    with patch.object(openai, "DefaultAsyncHttpxClient", wraps=openai.DefaultAsyncHttpxClient) as http_client:
+        make_client()._make_client()
+    assert http_client.call_args.kwargs["limits"].keepalive_expiry < 5.0
+
+
 def test_the_open_files_limit_fits_every_connection(monkeypatch):
     # 2026-09-29: a worker container's soft limit of 1024 failed every connect past ~1000 in flight (EMFILE).
     limit = {"nofile": (1024, 524288)}

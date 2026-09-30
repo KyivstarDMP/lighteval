@@ -77,6 +77,7 @@ _CONNECT_RETRY_SLEEP_S = 1.0
 _STALL_ABORT_AFTER = 8
 _DEFAULT_MAX_LENGTH = 4096
 _DEFAULT_STALL_S = 600.0  # the stall bound when the config leaves `timeout` unset
+_KEEPALIVE_EXPIRY_S = 2.0  # below vLLM's HTTP keep-alive (5 s): never reuse a connection the server closed
 
 # Adaptive concurrency: how the in-flight limit follows the server's load.
 _LOAD_INTERVAL_S = 2.0
@@ -555,7 +556,9 @@ class VLLMOpenAIClient(LightevalModel):
         """
         _fit_open_files(self.concurrent_requests)
         limits = httpx.Limits(
-            max_connections=self.concurrent_requests, max_keepalive_connections=self.concurrent_requests
+            max_connections=self.concurrent_requests,
+            max_keepalive_connections=self.concurrent_requests,
+            keepalive_expiry=_KEEPALIVE_EXPIRY_S,
         )
         return AsyncOpenAI(
             base_url=self.base_url,
