@@ -227,7 +227,11 @@ class SampleCache:
         # If we just use the pandas dict, lists are converted to np arrays which we don't want
         if isinstance(sample, pd.core.series.Series):
             sample = json.loads(sample.to_json())
-        return ModelResponse(**sample["sample"])
+        response = sample["sample"]
+        if response.get("logprobs"):
+            # to_json writes -inf, the logprob of a choice the model could not score, as null
+            response["logprobs"] = [float("-inf") if value is None else value for value in response["logprobs"]]
+        return ModelResponse(**response)
 
     def _dump_sample(self, result: Union[dict, ModelResponse]) -> dict:
         """Dumps the sample in the correct format for file saving

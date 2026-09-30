@@ -290,6 +290,8 @@ class LoglikelihoodAcc(SampleLevelComputation):
             else choices_logprobs
         )
 
+        if not np.isfinite(normalized_log_probs).any():
+            return 0  # no choice could be scored; argmax would pick the first
         best_choice = np.argmax(normalized_log_probs)
         return int(best_choice in gold_ixs)
 
