@@ -60,4 +60,11 @@ class TestRemoveReasoningTags(unittest.TestCase):
         text = "<think> Reasoning section. Answer section"
         tag_pairs = [("<think>", "</think>")]
         result = remove_reasoning_tags(text, tag_pairs)
-        self.assertEqual(result, "<think> Reasoning section. Answer section")
+        self.assertEqual(result, "")  # an unterminated thought (budget exhausted) is all reasoning
+
+    def test_unclosed_span_after_a_closed_one(self):
+        self.assertEqual(remove_reasoning_tags("<think>a</think>Answer<think>b", [("<think>", "</think>")]), "Answer")
+
+    def test_empty_start_tag_never_wipes_the_answer(self):
+        self.assertEqual(remove_reasoning_tags("Reasoning</think>Answer", [("", "</think>")]), "Answer")
+        self.assertEqual(remove_reasoning_tags("No closing tag", [("", "</think>")]), "No closing tag")
