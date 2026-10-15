@@ -183,12 +183,13 @@ class TestConfig:
         # The exact inline shape benchcore emits for local models.
         args = (
             "model_name=org/model-it,use_chat_template=true,concurrent_requests=64,timeout=600.0,"
-            "max_model_length=5632,base_url=http://localhost:41321/v1,"
+            "max_model_length=5632,base_url=http://localhost:41321/v1,server_image=vllm/vllm-openai@sha256:ab12,"
             "chat_template_kwargs={enable_thinking:false},generation_parameters={temperature:0,top_p:1}"
         )
         config = VLLMOpenAIModelConfig.from_args(args)
         assert config.model_name == "org/model-it"
         assert config.base_url == "http://localhost:41321/v1"
+        assert config.server_image == "vllm/vllm-openai@sha256:ab12"
         assert config.use_chat_template is True
         assert config.concurrent_requests == 64
         assert config.timeout == 600.0
@@ -227,9 +228,16 @@ class TestConfig:
             c = VLLMOpenAIModelConfig(
                 model_name="org/m", base_url="http://x/v1", use_chat_template=False, cache_dir=temp_dir
             )
+            d = VLLMOpenAIModelConfig(
+                model_name="org/m", base_url="http://x/v1", server_image="vllm@sha256:aa", cache_dir=temp_dir
+            )
+            e = VLLMOpenAIModelConfig(
+                model_name="org/m", base_url="http://x/v1", server_image="vllm@sha256:bb", cache_dir=temp_dir
+            )
             cache = SampleCache(a)
             assert cache.get_model_hash(a) != cache.get_model_hash(b)
             assert cache.get_model_hash(a) != cache.get_model_hash(c)
+            assert len({cache.get_model_hash(config) for config in (a, d, e)}) == 3
 
 
 # ---------------------------------------------------------------------------
