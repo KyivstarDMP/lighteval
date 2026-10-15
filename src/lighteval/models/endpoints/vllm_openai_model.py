@@ -502,10 +502,11 @@ class VLLMOpenAIModelConfig(ModelConfig):
         pairwise_tokenization (bool):
             Tokenize context and continuation separately instead of jointly
             (``tok_encode_pair``); default ``False``, as in-process.
-        server_image (str | None):
-            The serving engine's image, by digest when known. Never sent to the
-            server; part of the sample cache key, so a cached answer is not
-            replayed against a different engine.
+        server_fingerprint (str | None):
+            Opaque identity of the engine behind ``base_url`` (an image digest,
+            say), when the caller knows it. Never sent to the server; part of
+            the sample cache key, so a cached answer is not replayed against a
+            different engine.
         api_max_retry / api_retry_sleep / api_retry_multiplier:
             Backoff schedule for transient failures (429/5xx).
 
@@ -534,7 +535,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
     trust_remote_code: bool = False
     add_special_tokens: bool | None = None
     pairwise_tokenization: bool = False
-    server_image: str | None = None
+    server_fingerprint: str | None = None
 
     CACHE_KEY_EXCLUDE: ClassVar[frozenset[str]] = frozenset(
         {
