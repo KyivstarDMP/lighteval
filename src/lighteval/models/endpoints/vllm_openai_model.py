@@ -109,6 +109,22 @@ class _StreamStall(openai.APITimeoutError):
         openai.APIConnectionError.__init__(self, message=detail, request=request)
 
 
+class _OverBudget(Exception):
+    """A prompt that a server started at the invocation's context budget would reject."""
+
+
+def _hold_prompt(usage, budget: int | None) -> None:
+    if budget is not None and usage is not None and usage.prompt_tokens >= budget:
+        raise _OverBudget(f"a {usage.prompt_tokens}-token prompt reaches the {budget}-token context budget")
+
+
+async def _close(stream) -> None:
+    closer = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+    if closer is not None:
+        with contextlib.suppress(Exception):
+            await closer()
+
+
 async def _await_unless_quiet(awaitable, *, quiet_for, stall_s: float):
     """Await ``awaitable``, raising ``_Quiet`` once ``quiet_for()`` reaches ``stall_s`` seconds before it finishes."""
     task = asyncio.ensure_future(awaitable)
@@ -155,10 +171,7 @@ async def _stream_chunks(stream, *, progress: _ProgressClock, stall_s: float):
             progress.tick()
             yield chunk
     finally:
-        closer = getattr(stream, "close", None) or getattr(stream, "aclose", None)
-        if closer is not None:
-            with contextlib.suppress(Exception):
-                await closer()
+        await _close(stream)
 
 
 class _ServerLoad(NamedTuple):
@@ -302,8 +315,41 @@ async def _steer(
             limiter.set_limit(limit)
 
 
+async def _stream_choices(
+    stream, num_samples: int, *, progress: _ProgressClock | None, stall_s: float, budget: int | None
+):
+    """Yield ``(index, choice, filled)`` for each choice in ``stream``, held to the context ``budget``.
+
+    A server window wider than the budget must not change the result, so the stream ends as one started at the
+    budget would end it: a prompt at or over the budget raises ``_OverBudget``, and a sample stops (``filled``) on
+    the chunk whose continuous usage reaches the budget.
+    """
+    chunks = stream if progress is None else _stream_chunks(stream, progress=progress, stall_s=stall_s)
+    filled: set[int] = set()
+    try:
+        async for chunk in chunks:
+            usage = getattr(chunk, "usage", None) if budget is not None else None
+            _hold_prompt(usage, budget)
+            for choice in getattr(chunk, "choices", None) or []:
+                index = getattr(choice, "index", 0) or 0
+                if index in filled:
+                    continue
+                if usage is not None and usage.prompt_tokens + (usage.completion_tokens or 0) >= budget:
+                    filled.add(index)
+                yield index, choice, index in filled
+            if len(filled) >= num_samples:
+                return
+    finally:
+        await _close(chunks)
+
+
 async def _collect_chat_stream(
-    stream, num_samples: int, *, progress: _ProgressClock | None = None, stall_s: float = _DEFAULT_STALL_S
+    stream,
+    num_samples: int,
+    *,
+    progress: _ProgressClock | None = None,
+    stall_s: float = _DEFAULT_STALL_S,
+    budget: int | None = None,
 ):
     """Fold a chat-completion stream into the shape ``greedy_until`` reads (``choices[i].message``).
 
@@ -314,21 +360,18 @@ async def _collect_chat_stream(
     content: list[list[str]] = [[] for _ in range(num_samples)]
     reasoning: list[list[str]] = [[] for _ in range(num_samples)]
     finish: list[str | None] = [None] * num_samples
-    chunks = stream if progress is None else _stream_chunks(stream, progress=progress, stall_s=stall_s)
-    async for chunk in chunks:
-        for choice in getattr(chunk, "choices", None) or []:
-            index = getattr(choice, "index", 0) or 0
-            while index >= len(content):
-                content.append([]), reasoning.append([]), finish.append(None)
-            delta = getattr(choice, "delta", None)
-            if delta is not None:
-                if piece := getattr(delta, "content", None):
-                    content[index].append(piece)
-                # vLLM names the parsed channel `reasoning` (0.19+); older servers said `reasoning_content`.
-                if thought := getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None):
-                    reasoning[index].append(thought)
-            if reason := getattr(choice, "finish_reason", None):
-                finish[index] = reason
+    choices = _stream_choices(stream, num_samples, progress=progress, stall_s=stall_s, budget=budget)
+    async for index, choice, filled in choices:
+        while index >= len(content):
+            content.append([]), reasoning.append([]), finish.append(None)
+        delta = getattr(choice, "delta", None)
+        if delta is not None:
+            if piece := getattr(delta, "content", None):
+                content[index].append(piece)
+            # vLLM names the parsed channel `reasoning` (0.19+); older servers said `reasoning_content`.
+            if thought := getattr(delta, "reasoning", None) or getattr(delta, "reasoning_content", None):
+                reasoning[index].append(thought)
+        finish[index] = getattr(choice, "finish_reason", None) or ("length" if filled else finish[index])
     return SimpleNamespace(
         choices=[
             SimpleNamespace(
@@ -342,21 +385,23 @@ async def _collect_chat_stream(
 
 
 async def _collect_text_stream(
-    stream, num_samples: int, *, progress: _ProgressClock | None = None, stall_s: float = _DEFAULT_STALL_S
+    stream,
+    num_samples: int,
+    *,
+    progress: _ProgressClock | None = None,
+    stall_s: float = _DEFAULT_STALL_S,
+    budget: int | None = None,
 ):
     """Fold a text-completion stream into ``choices[i].text``."""
     text: list[list[str]] = [[] for _ in range(num_samples)]
     finish: list[str | None] = [None] * num_samples
-    chunks = stream if progress is None else _stream_chunks(stream, progress=progress, stall_s=stall_s)
-    async for chunk in chunks:
-        for choice in getattr(chunk, "choices", None) or []:
-            index = getattr(choice, "index", 0) or 0
-            while index >= len(text):
-                text.append([]), finish.append(None)
-            if piece := getattr(choice, "text", None):
-                text[index].append(piece)
-            if reason := getattr(choice, "finish_reason", None):
-                finish[index] = reason
+    choices = _stream_choices(stream, num_samples, progress=progress, stall_s=stall_s, budget=budget)
+    async for index, choice, filled in choices:
+        while index >= len(text):
+            text.append([]), finish.append(None)
+        if piece := getattr(choice, "text", None):
+            text[index].append(piece)
+        finish[index] = getattr(choice, "finish_reason", None) or ("length" if filled else finish[index])
     return SimpleNamespace(
         choices=[SimpleNamespace(index=i, finish_reason=finish[i], text="".join(text[i])) for i in range(len(text))]
     )
@@ -424,8 +469,11 @@ class VLLMOpenAIModelConfig(ModelConfig):
             by the server (``truncate_prompt_tokens``) and log-likelihood token
             ids by the client, keeping the last tokens that leave room for the
             answer — the in-process backend's rule. Docs with images are never
-            truncated. When unset, nothing is truncated and ``max_length`` is
-            probed once from ``/models``.
+            truncated. What truncation does not cover is held to the budget
+            from the token counts the server reports: a prompt at or over it
+            degrades like a 400, and a generation stops once it fills it — what
+            a server started at the budget does. When unset, nothing is
+            truncated and ``max_length`` is probed once from ``/models``.
         client_tokenization (bool):
             ``True`` (default) scores loglikelihood from client-side token ids:
             the context is rendered locally (chat template with a generation
@@ -639,8 +687,9 @@ class VLLMOpenAIClient(LightevalModel):
           inside a stream (a generation the server could not parse, say):
           exponential backoff up to ``api_max_retry``, then degrade this one
           request to ``None``.
-        - Other 4xx (bad request, e.g. context overflow): no retry, degrade to
-          ``None`` so one oversized doc doesn't abort a long run.
+        - Other 4xx (bad request, e.g. context overflow), and a prompt over the
+          context budget: no retry, degrade to ``None`` so one oversized doc
+          doesn't abort a long run.
         """
         connect_failures = 0
         for attempt in range(self._retry_upper_bound()):
@@ -648,6 +697,10 @@ class VLLMOpenAIClient(LightevalModel):
                 result = await call()
                 self._consecutive_stalls = 0
                 return result
+            except _OverBudget as e:
+                self._consecutive_stalls = 0
+                logger.warning(f"{label}: {e}. Not retrying; degrading this request.")
+                return None
             except (openai.APITimeoutError, httpx.TimeoutException) as e:
                 self._consecutive_stalls += 1
                 if self._consecutive_stalls >= _STALL_ABORT_AFTER:
@@ -743,10 +796,16 @@ class VLLMOpenAIClient(LightevalModel):
         room = self._context_budget - reserve
         return room if room > 0 else None
 
+    def _stream_params(self) -> tuple[dict, dict]:
+        standard, extra_body = self._sampling_params()
+        if self._context_budget is not None:
+            extra_body["stream_options"] = {"include_usage": True, "continuous_usage_stats": True}
+        return standard, extra_body
+
     async def _call_api_chat_generative(
         self, client: AsyncOpenAI, messages, max_new_tokens, num_samples, *, prompt_room: int | None = None
     ):
-        standard, extra_body = self._sampling_params()
+        standard, extra_body = self._stream_params()
         if prompt_room is not None:
             extra_body["truncate_prompt_tokens"] = prompt_room
         if self.prompt_manager.chat_template_kwargs:
@@ -771,14 +830,16 @@ class VLLMOpenAIClient(LightevalModel):
                     **standard,
                 )
             )
-            return await _collect_chat_stream(stream, num_samples, progress=self._clock(), stall_s=self._stall_s())
+            return await _collect_chat_stream(
+                stream, num_samples, progress=self._clock(), stall_s=self._stall_s(), budget=self._context_budget
+            )
 
         return await self._request(call, label="chat completion")
 
     async def _call_api_text_generative(
         self, client: AsyncOpenAI, prompt: str, max_new_tokens, num_samples, stop, *, prompt_room: int | None = None
     ):
-        standard, extra_body = self._sampling_params()
+        standard, extra_body = self._stream_params()
         extra_body["add_special_tokens"] = self.add_special_tokens
         if prompt_room is not None:
             extra_body["truncate_prompt_tokens"] = prompt_room
@@ -797,7 +858,9 @@ class VLLMOpenAIClient(LightevalModel):
                     **standard,
                 )
             )
-            return await _collect_text_stream(stream, num_samples, progress=self._clock(), stall_s=self._stall_s())
+            return await _collect_text_stream(
+                stream, num_samples, progress=self._clock(), stall_s=self._stall_s(), budget=self._context_budget
+            )
 
         return await self._request(call, label="text completion")
 
@@ -887,7 +950,7 @@ class VLLMOpenAIClient(LightevalModel):
         """Score ``prompt`` (text, or token ids) via ``echo=True`` + ``logprobs=1`` (deterministic)."""
 
         async def call():
-            return await client.completions.create(
+            response = await client.completions.create(
                 model=self.model,
                 prompt=prompt,
                 max_tokens=1,  # generate exactly 1 token (echo gives prompt logprobs)
@@ -896,6 +959,8 @@ class VLLMOpenAIClient(LightevalModel):
                 temperature=0.0,  # deterministic scoring
                 seed=self.generation_parameters.seed if self.generation_parameters.seed is not None else NOT_GIVEN,
             )
+            _hold_prompt(getattr(response, "usage", None), self._context_budget)
+            return response
 
         return await self._request(call, label="echo loglikelihood")
 
@@ -1068,7 +1133,7 @@ class VLLMOpenAIClient(LightevalModel):
             extra_body["chat_template_kwargs"] = dict(self.prompt_manager.chat_template_kwargs)
 
         async def call():
-            return await client.chat.completions.create(
+            response = await client.chat.completions.create(
                 model=self.model,
                 messages=messages,
                 max_tokens=1,
@@ -1076,6 +1141,8 @@ class VLLMOpenAIClient(LightevalModel):
                 seed=self.generation_parameters.seed if self.generation_parameters.seed is not None else NOT_GIVEN,
                 extra_body=extra_body,
             )
+            _hold_prompt(getattr(response, "usage", None), self._context_budget)
+            return response
 
         return await self._request(call, label="chat loglikelihood")
 

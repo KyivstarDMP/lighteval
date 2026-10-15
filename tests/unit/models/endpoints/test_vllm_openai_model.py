@@ -571,6 +571,102 @@ class TestStreamedGeneration:
         assert sdk.completions.create.call_args.kwargs["extra_body"]["truncate_prompt_tokens"] == 5
 
 
+def _usage_stream(prompt_tokens, pieces, *, chat, consumed):
+    """A stream carrying vLLM's continuous usage (one token per piece); ``consumed`` counts the chunks read."""
+
+    def choice(piece):
+        if chat:
+            return SimpleNamespace(
+                index=0, finish_reason=None, delta=SimpleNamespace(content=piece, reasoning_content=None)
+            )
+        return SimpleNamespace(index=0, finish_reason=None, text=piece)
+
+    async def chunks():
+        for completion_tokens, piece in enumerate([None, *pieces]):
+            consumed.append(piece)
+            usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+            yield SimpleNamespace(choices=[choice(piece)], usage=usage)
+
+    return chunks()
+
+
+class TestContextBudget:
+    def test_streams_report_usage_only_under_a_context_budget(self):
+        def sent(budget):
+            client = make_client()
+            client._context_budget = budget
+            sdk = MagicMock()
+            sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["ok"]))
+            run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1))
+            return (sdk.chat.completions.create.call_args.kwargs["extra_body"] or {}).get("stream_options")
+
+        assert sent(None) is None
+        assert sent(100) == {"include_usage": True, "continuous_usage_stats": True}
+
+    @pytest.mark.parametrize("chat", [True, False])
+    def test_a_prompt_at_the_budget_degrades_without_reading_the_generation(self, chat):
+        client = make_client(use_chat_template=chat)
+        client._context_budget = 10
+        consumed = []
+        sdk = MagicMock()
+        stream = _usage_stream(10, ["a", "b", "c"], chat=chat, consumed=consumed)
+        if chat:
+            sdk.chat.completions.create = AsyncMock(return_value=stream)
+            response = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], None, 1))
+        else:
+            sdk.completions.create = AsyncMock(return_value=stream)
+            response = run(client._call_api_text_generative(sdk, "Q", None, 1, None))
+        assert response is None
+        assert consumed == [None]
+
+    @pytest.mark.parametrize("chat", [True, False])
+    def test_a_generation_stops_once_it_fills_the_budget(self, chat):
+        client = make_client(use_chat_template=chat)
+        client._context_budget = 10
+        consumed = []
+        sdk = MagicMock()
+        stream = _usage_stream(6, ["a", "b", "c", "d", "e", "f"], chat=chat, consumed=consumed)
+        if chat:
+            sdk.chat.completions.create = AsyncMock(return_value=stream)
+            response = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], None, 1))
+            text = response.choices[0].message.content
+        else:
+            sdk.completions.create = AsyncMock(return_value=stream)
+            response = run(client._call_api_text_generative(sdk, "Q", None, 1, None))
+            text = response.choices[0].text
+        assert (text, response.choices[0].finish_reason) == ("abcd", "length")
+        assert consumed == [None, "a", "b", "c", "d"]
+
+    def test_a_generation_inside_the_budget_is_untouched(self):
+        client = make_client()
+        client._context_budget = 100
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(
+            return_value=_usage_stream(6, ["a", "b"], chat=True, consumed=[]),
+        )
+        response = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], None, 1))
+        assert (response.choices[0].message.content, response.choices[0].finish_reason) == ("ab", None)
+
+    def test_loglikelihood_prompts_at_the_budget_degrade(self):
+        client = make_client()
+        client._context_budget = 10
+
+        def scored(prompt_tokens):
+            response = make_sdk_chat_response(prompt_logprobs=[])
+            response.usage = SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=1)
+            echo = make_sdk_completion_response(["a"], [None])
+            echo.usage = response.usage
+            sdk = MagicMock()
+            sdk.chat.completions.create = AsyncMock(return_value=response)
+            sdk.completions.create = AsyncMock(return_value=echo)
+            chat = run(client._call_api_chat_prompt_logprobs_async(sdk, [{"role": "user", "content": "Q"}]))
+            text = run(client._call_api_text_completion_async(sdk, [1, 2, 3]))
+            return chat is response, text is echo
+
+        assert scored(9) == (True, True)
+        assert scored(10) == (False, False)
+
+
 # ---------------------------------------------------------------------------
 # 3b'. Stall detection: queued behind others is not stuck
 # ---------------------------------------------------------------------------
