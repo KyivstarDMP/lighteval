@@ -394,8 +394,12 @@ class LightevalTask:
         for doc in eval_docs[:n_samples]:
             num_fewshots = self.dataset_config.num_fewshots
             doc.task_name = self.full_name
-            doc.fewshot_samples = self.fewshot_sampler.sample_fewshot_examples(
-                num_fewshots, 0, formatted_doc=doc, sampler=rnd
+            # A prompt function may set `fewshot_samples` itself, e.g. to carry a conversation's
+            # earlier turns. Keep them after any sampled examples, so all render as earlier turns.
+            # Like `sampling_methods.extend` below, this assumes one `get_docs` call per task.
+            doc.fewshot_samples = (
+                self.fewshot_sampler.sample_fewshot_examples(num_fewshots, 0, formatted_doc=doc, sampler=rnd)
+                + doc.fewshot_samples
             )
             doc.sampling_methods.extend(self.sampling_methods)
             doc.generation_size = self.generation_size
