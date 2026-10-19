@@ -21,7 +21,10 @@
 # SOFTWARE.
 
 
+import json
+
 from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
+from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc
 
 
@@ -84,3 +87,67 @@ def test_hf_data_files(tmp_path):
 
     eval_docs = task.eval_docs()
     assert [doc.query for doc in eval_docs] == src_docs
+
+
+def conversation_prompt_function(item, task_name):
+    """Final user turn as the query; earlier turns carried on the doc as few-shot samples."""
+    history = [
+        Doc(query=turn["user"], choices=[turn["assistant"]], gold_index=0, task_name=task_name)
+        for turn in item["history"]
+    ]
+    return Doc(query=item["text"], choices=[""], gold_index=0, task_name=task_name, fewshot_samples=history)
+
+
+def _conversation_task(tmp_path, num_fewshots):
+    data_file = tmp_path / "conversations.jsonl"
+    rows = [
+        {"text": "And the capital?", "history": [{"user": "Name a country.", "assistant": "France."}]},
+        {"text": "Hello", "history": []},
+    ]
+    data_file.write_text("\n".join(json.dumps(row) for row in rows))
+    cfg = LightevalTaskConfig(
+        name="test_conversation",
+        prompt_function=conversation_prompt_function,
+        hf_repo="json",
+        hf_subset="default",
+        metrics=[],
+        hf_avail_splits=["train"],
+        evaluation_splits=["train"],
+        few_shots_select="sequential",
+        hf_data_files=str(data_file),
+    )
+    cfg.num_fewshots = num_fewshots
+    return LightevalTask(cfg)
+
+
+def test_doc_fewshot_samples_kept_at_zero_shots(tmp_path):
+    docs = {doc.query: doc for doc in _conversation_task(tmp_path, num_fewshots=0).get_docs()}
+
+    assert [(s.query, s.get_golds()[0]) for s in docs["And the capital?"].fewshot_samples] == [
+        ("Name a country.", "France.")
+    ]
+    assert docs["Hello"].fewshot_samples == []
+    messages = PromptManager(use_chat_template=True, tokenizer=None).prepare_prompt_api(docs["And the capital?"])
+    assert messages == [
+        {"role": "user", "content": "Name a country."},
+        {"role": "assistant", "content": "France."},
+        {"role": "user", "content": "And the capital?"},
+    ]
+
+
+def test_sampled_fewshots_added_before_doc_turns(tmp_path):
+    # With shots requested, sampled examples come first, then the doc's own turns.
+    docs = {doc.query: doc for doc in _conversation_task(tmp_path, num_fewshots=1).get_docs()}
+
+    convo = docs["And the capital?"]
+    assert len(convo.fewshot_samples) == 2
+    assert convo.fewshot_samples[-1].query == "Name a country."
+    messages = PromptManager(use_chat_template=True, tokenizer=None).prepare_prompt_api(convo)
+    assert [m["role"] for m in messages] == ["user", "assistant", "user", "assistant", "user"]
+    assert messages[2:] == [
+        {"role": "user", "content": "Name a country."},
+        {"role": "assistant", "content": "France."},
+        {"role": "user", "content": "And the capital?"},
+    ]
+    # A doc without its own turns gets only the sampled example, as before.
+    assert len(docs["Hello"].fewshot_samples) == 1
