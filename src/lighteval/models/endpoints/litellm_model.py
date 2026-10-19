@@ -312,7 +312,9 @@ class LiteLLMClient(LightevalModel):
                     )
                     if error_string in e.__dict__["message"]:
                         logger.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
+                        filtered = LitellmModelResponse()
+                        filtered.choices[0].finish_reason = "content_filter"
+                        return filtered
                 raise
 
             # If response is empty, retry once without caching (maybe the error is recoverable and solved with a retry)
@@ -454,6 +456,9 @@ class LiteLLMClient(LightevalModel):
                         # In empty responses, the model should return an empty string instead of None
                         text=result if result[0] else [""],
                         reasonings=reasonings,
+                        finish_reasons=[None]
+                        if gave_up
+                        else [getattr(choice, "finish_reason", None) for choice in response.choices],
                         input=context,
                         error=RequestFailure.RETRIES_EXHAUSTED if gave_up else None,
                         error_detail=response.detail if gave_up else None,

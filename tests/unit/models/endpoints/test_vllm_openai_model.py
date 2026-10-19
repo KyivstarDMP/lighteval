@@ -235,9 +235,13 @@ class TestConfig:
             e = VLLMOpenAIModelConfig(
                 model_name="org/m", base_url="http://x/v1", server_fingerprint="vllm@sha256:bb", cache_dir=temp_dir
             )
+            f = VLLMOpenAIModelConfig(
+                model_name="org/m", base_url="http://x/v1", return_token_ids=False, cache_dir=temp_dir
+            )
             cache = SampleCache(a)
             assert cache.get_model_hash(a) != cache.get_model_hash(b)
             assert cache.get_model_hash(a) != cache.get_model_hash(c)
+            assert cache.get_model_hash(a) != cache.get_model_hash(f)
             assert len({cache.get_model_hash(config) for config in (a, d, e)}) == 3
 
 
@@ -318,7 +322,17 @@ class TestPayloadMapping:
         assert "stop" not in kwargs
         assert kwargs["temperature"] == 1.0
         # vLLM-only knobs + template kwargs ride in extra_body.
-        assert kwargs["extra_body"] == {"top_k": 64, "chat_template_kwargs": {"enable_thinking": False}}
+        assert kwargs["extra_body"] == {
+            "top_k": 64,
+            "return_token_ids": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+    def test_token_ids_are_asked_for_unless_turned_off(self):
+        client = make_client()
+        assert client._stream_params()[1] == {"return_token_ids": True}
+        client.return_token_ids = False
+        assert client._stream_params()[1] == {}
 
     def test_task_stop_sequences_win_over_config_stop_tokens(self):
         # Text-completion route only: the chat route never sends stop sequences.
@@ -534,6 +548,47 @@ class TestStreamedGeneration:
         assert result.text == ["final"]
         assert result.reasonings == ["r"]
         assert result.error is None
+        assert (result.finish_reasons, result.input_tokens, result.output_tokens) == (["stop"], [], [])
+
+    def test_greedy_until_keeps_the_token_ids_and_why_the_generation_stopped(self):
+        async def chunks():
+            def chunk(token_ids, content=None, finish_reason=None, **fields):
+                delta = SimpleNamespace(content=content, reasoning=None)
+                choice = SimpleNamespace(index=0, finish_reason=finish_reason, token_ids=token_ids, delta=delta)
+                return SimpleNamespace(choices=[choice], **fields)
+
+            yield chunk([], content="", prompt_token_ids=[1, 2, 3])
+            yield chunk([10, 11])  # tokens the reasoning parser kept back
+            yield chunk([12], content="42")
+            yield chunk([13], finish_reason="length")
+
+        client = make_client()
+        doc = Doc(query="Q?", choices=[], gold_index=0, task_name="t", generation_size=8)
+        doc.id = "0"
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(return_value=chunks())
+        sdk.__aenter__ = AsyncMock(return_value=sdk)
+        sdk.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            (result,) = client.greedy_until([doc])
+        assert (result.text, result.finish_reasons) == (["42"], ["length"])
+        assert (result.input_tokens, result.output_tokens) == ([1, 2, 3], [[10, 11, 12, 13]])
+        assert (result[0].finish_reasons, result[0].output_tokens) == (["length"], [[10, 11, 12, 13]])
+
+    def test_text_completions_keep_the_token_ids_each_choice_carries(self):
+        async def chunks():
+            yield SimpleNamespace(
+                choices=[
+                    SimpleNamespace(index=0, finish_reason=None, text="4", token_ids=[7], prompt_token_ids=[1, 2])
+                ]
+            )
+            yield SimpleNamespace(choices=[SimpleNamespace(index=0, finish_reason="stop", text="2", token_ids=[8])])
+
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(return_value=chunks())
+        response = run(make_client(use_chat_template=False)._call_api_text_generative(sdk, "p", 8, 1, None))
+        assert response.prompt_token_ids == [1, 2]
+        assert [(choice.text, choice.token_ids) for choice in response.choices] == [("42", [7, 8])]
 
     def test_greedy_until_says_why_it_gave_up_on_a_doc(self):
         client = make_client()

@@ -65,7 +65,9 @@ def _make_doc(query: str, stop_sequences: list[str]) -> Doc:
 
 def _mock_response(content: str):
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content, reasoning_content=None))],
+        choices=[
+            SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=content, reasoning_content=None))
+        ],
     )
 
 
@@ -165,3 +167,4 @@ def test_a_request_given_up_on_after_its_retries_says_so():
         (["fine"], None, None),
         ([""], "retries_exhausted", "RuntimeError: provider unavailable"),
     ]
+    assert [result.finish_reasons for result in results] == [["stop"], [None]]

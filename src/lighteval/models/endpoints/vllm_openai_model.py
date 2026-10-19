@@ -334,7 +334,7 @@ async def _steer(
 async def _stream_choices(
     stream, num_samples: int, *, progress: _ProgressClock | None, stall_s: float, budget: int | None
 ):
-    """Yield ``(index, choice, filled)`` for each choice in ``stream``, held to the context ``budget``.
+    """Yield ``(index, choice, filled, chunk)`` for each choice in ``stream``, held to the context ``budget``.
 
     A server window wider than the budget must not change the result, so the stream ends as one started at the
     budget would end it: a prompt at or over the budget raises ``_OverBudget``, and a sample stops (``filled``) on
@@ -352,11 +352,27 @@ async def _stream_choices(
                     continue
                 if usage is not None and usage.prompt_tokens + (usage.completion_tokens or 0) >= budget:
                     filled.add(index)
-                yield index, choice, index in filled
+                yield index, choice, index in filled, chunk
             if len(filled) >= num_samples:
                 return
     finally:
         await _close(chunks)
+
+
+def _add_token_ids(tokens: list[list[int] | None], index: int, choice) -> None:
+    if (ids := getattr(choice, "token_ids", None)) is not None:
+        if tokens[index] is None:
+            tokens[index] = []
+        tokens[index].extend(ids)
+
+
+def _prompt_token_ids(chunk, choice) -> list[int] | None:
+    return getattr(chunk, "prompt_token_ids", None) or getattr(choice, "prompt_token_ids", None)
+
+
+def _output_token_ids(choices) -> list[list[int]]:
+    ids = [getattr(choice, "token_ids", None) for choice in choices]
+    return [list(sample) for sample in ids] if ids and all(sample is not None for sample in ids) else []
 
 
 async def _collect_chat_stream(
@@ -376,10 +392,14 @@ async def _collect_chat_stream(
     content: list[list[str]] = [[] for _ in range(num_samples)]
     reasoning: list[list[str]] = [[] for _ in range(num_samples)]
     finish: list[str | None] = [None] * num_samples
+    tokens: list[list[int] | None] = [None] * num_samples
+    prompt_tokens = None
     choices = _stream_choices(stream, num_samples, progress=progress, stall_s=stall_s, budget=budget)
-    async for index, choice, filled in choices:
+    async for index, choice, filled, chunk in choices:
         while index >= len(content):
-            content.append([]), reasoning.append([]), finish.append(None)
+            content.append([]), reasoning.append([]), finish.append(None), tokens.append(None)
+        prompt_tokens = prompt_tokens or _prompt_token_ids(chunk, choice)
+        _add_token_ids(tokens, index, choice)
         delta = getattr(choice, "delta", None)
         if delta is not None:
             if piece := getattr(delta, "content", None):
@@ -389,14 +409,16 @@ async def _collect_chat_stream(
                 reasoning[index].append(thought)
         finish[index] = getattr(choice, "finish_reason", None) or ("length" if filled else finish[index])
     return SimpleNamespace(
+        prompt_token_ids=prompt_tokens,
         choices=[
             SimpleNamespace(
                 index=i,
                 finish_reason=finish[i],
+                token_ids=tokens[i],
                 message=SimpleNamespace(content="".join(content[i]), reasoning_content="".join(reasoning[i]) or None),
             )
             for i in range(len(content))
-        ]
+        ],
     )
 
 
@@ -411,15 +433,23 @@ async def _collect_text_stream(
     """Fold a text-completion stream into ``choices[i].text``."""
     text: list[list[str]] = [[] for _ in range(num_samples)]
     finish: list[str | None] = [None] * num_samples
+    tokens: list[list[int] | None] = [None] * num_samples
+    prompt_tokens = None
     choices = _stream_choices(stream, num_samples, progress=progress, stall_s=stall_s, budget=budget)
-    async for index, choice, filled in choices:
+    async for index, choice, filled, chunk in choices:
         while index >= len(text):
-            text.append([]), finish.append(None)
+            text.append([]), finish.append(None), tokens.append(None)
+        prompt_tokens = prompt_tokens or _prompt_token_ids(chunk, choice)
+        _add_token_ids(tokens, index, choice)
         if piece := getattr(choice, "text", None):
             text[index].append(piece)
         finish[index] = getattr(choice, "finish_reason", None) or ("length" if filled else finish[index])
     return SimpleNamespace(
-        choices=[SimpleNamespace(index=i, finish_reason=finish[i], text="".join(text[i])) for i in range(len(text))]
+        prompt_token_ids=prompt_tokens,
+        choices=[
+            SimpleNamespace(index=i, finish_reason=finish[i], token_ids=tokens[i], text="".join(text[i]))
+            for i in range(len(text))
+        ],
     )
 
 
@@ -518,6 +548,12 @@ class VLLMOpenAIModelConfig(ModelConfig):
         pairwise_tokenization (bool):
             Tokenize context and continuation separately instead of jointly
             (``tok_encode_pair``); default ``False``, as in-process.
+        return_token_ids (bool):
+            Ask the server for each generation's prompt and generated token ids
+            (vLLM's ``return_token_ids``), kept as ``input_tokens`` and
+            ``output_tokens``, with the finish reason in ``finish_reasons``;
+            default ``True``. Part of the sample cache key, so answers cached
+            without ids are not replayed.
         server_fingerprint (str | None):
             Opaque identity of the engine behind ``base_url`` (an image digest,
             say), when the caller knows it. Never sent to the server; part of
@@ -551,6 +587,7 @@ class VLLMOpenAIModelConfig(ModelConfig):
     trust_remote_code: bool = False
     add_special_tokens: bool | None = None
     pairwise_tokenization: bool = False
+    return_token_ids: bool = True
     server_fingerprint: str | None = None
 
     CACHE_KEY_EXCLUDE: ClassVar[frozenset[str]] = frozenset(
@@ -581,6 +618,7 @@ class VLLMOpenAIClient(LightevalModel):
     _trust_remote_code = False
     _context_budget: int | None = None
     _add_special_tokens: bool | None = None
+    return_token_ids = True
 
     def __init__(self, config: VLLMOpenAIModelConfig) -> None:
         self.config = config
@@ -599,6 +637,7 @@ class VLLMOpenAIClient(LightevalModel):
         self._revision = None if config.tokenizer else config.revision
         self._trust_remote_code = config.trust_remote_code
         self._add_special_tokens = config.add_special_tokens
+        self.return_token_ids = config.return_token_ids
 
         self.API_MAX_RETRY = config.api_max_retry
         self.API_RETRY_SLEEP = config.api_retry_sleep
@@ -821,6 +860,8 @@ class VLLMOpenAIClient(LightevalModel):
         standard, extra_body = self._sampling_params()
         if self._context_budget is not None:
             extra_body["stream_options"] = {"include_usage": True, "continuous_usage_stats": True}
+        if self.return_token_ids:
+            extra_body["return_token_ids"] = True
         return standard, extra_body
 
     async def _call_api_chat_generative(
@@ -957,7 +998,10 @@ class VLLMOpenAIClient(LightevalModel):
                                 # In empty responses, the model should return an empty string instead of None
                                 text=result if result and result[0] else [""],
                                 reasonings=reasonings,
+                                finish_reasons=[getattr(choice, "finish_reason", None) for choice in response.choices],
                                 input=context,
+                                input_tokens=list(getattr(response, "prompt_token_ids", None) or []),
+                                output_tokens=_output_token_ids(response.choices),
                             )
                         )
 

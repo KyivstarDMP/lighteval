@@ -54,6 +54,7 @@ def test_a_failed_sample_is_returned_but_asked_again_by_the_next_run(tmp_path):
     }
     first = _Model(tmp_path, answers).greedy_until(_docs(3))
     assert [(r.text, r.error) for r in first] == [(["a"], None), ([""], "retries_exhausted"), (["c"], None)]
+    assert first[1][0].error == "retries_exhausted"
 
     rerun = _Model(tmp_path, {**answers, "1": ModelResponse(text=["b"])})
     assert [r.text for r in rerun.greedy_until(_docs(3))] == [["a"], ["b"], ["c"]]
