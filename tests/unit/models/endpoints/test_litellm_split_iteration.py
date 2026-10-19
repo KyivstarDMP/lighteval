@@ -65,7 +65,9 @@ def _make_doc(query: str, stop_sequences: list[str]) -> Doc:
 
 def _mock_response(content: str):
     return SimpleNamespace(
-        choices=[SimpleNamespace(message=SimpleNamespace(content=content, reasoning_content=None))],
+        choices=[
+            SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content=content, reasoning_content=None))
+        ],
     )
 
 
@@ -107,9 +109,7 @@ def test_greedy_until_uses_global_event_loop():
     the original doc order after the internal length/param sort."""
     client = _build_client("openai/gpt-4.1-nano", concurrent_requests=4)
     client._cache = None  # None disables the @cached wrapper so the real body runs
-    client.prompt_manager = SimpleNamespace(
-        prepare_prompt_api=lambda doc: [{"role": "user", "content": doc.query}]
-    )
+    client.prompt_manager = SimpleNamespace(prepare_prompt_api=lambda doc: [{"role": "user", "content": doc.query}])
 
     # Differing generation_size groups docs into separate generative splits. Input order is
     # shuffled relative to the sort key so get_original_order has real work to undo.
@@ -146,3 +146,25 @@ def test_greedy_until_uses_global_event_loop():
     assert len(loop_ids) == 1
     # Original order preserved despite the internal sort that grouped by generation_size.
     assert [response.text[0] for response in responses] == ["long a", "short a", "long b", "short b"]
+
+
+def test_a_request_given_up_on_after_its_retries_says_so():
+    client = _build_client("openai/gpt-4.1-nano", api_max_retry=2)
+    client._cache = None
+    client.prompt_manager = SimpleNamespace(prepare_prompt_api=lambda doc: [{"role": "user", "content": doc.query}])
+    docs = [Doc(query=query, choices=[], gold_index=0, generation_size=8, task_name="t") for query in ("ok", "down")]
+
+    async def fake_acompletion(**kwargs):
+        if kwargs["messages"][-1]["content"] == "down":
+            raise RuntimeError("provider unavailable")
+        return _mock_response("fine")
+
+    with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=False):
+        with patch("lighteval.models.endpoints.litellm_model.litellm.acompletion", side_effect=fake_acompletion):
+            results = client.greedy_until(docs)
+
+    assert [(result.text, result.error, result.error_detail) for result in results] == [
+        (["fine"], None, None),
+        ([""], "retries_exhausted", "RuntimeError: provider unavailable"),
+    ]
+    assert [result.finish_reasons for result in results] == [["stop"], [None]]

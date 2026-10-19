@@ -21,8 +21,6 @@
 # SOFTWARE.
 
 import asyncio
-import base64
-import io
 import logging
 from json import JSONDecodeError
 
@@ -33,8 +31,8 @@ from tqdm.asyncio import tqdm as async_tqdm
 
 from lighteval.data import GenerativeTaskDataset
 from lighteval.models.abstract_model import LightevalModel, ModelConfig
-from lighteval.models.model_output import ModelResponse
-from lighteval.tasks.prompt_manager import PromptManager, order_multimodal_content
+from lighteval.models.model_output import ModelResponse, RequestFailure
+from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.cache_management import SampleCache, cached
 from lighteval.utils.imports import is_package_available, requires
@@ -53,12 +51,21 @@ if is_package_available("litellm"):
     logging.getLogger("LiteLLM").handlers.clear()
 
     litellm.cache = Cache(type=LiteLLMCacheType.DISK)
+
+    class _GaveUp(LitellmModelResponse):
+        """A request given up on after its retries: scored blank and kept out of the sample cache."""
+
+        def __init__(self, detail: str):
+            super().__init__()
+            self.detail = detail
+
 else:
     from unittest.mock import Mock
 
     litellm = Mock()
     encode = Mock()
     LitellmModelResponse = Mock()
+    _GaveUp = Mock
 
 
 class LiteLLMModelConfig(ModelConfig):
@@ -202,30 +209,6 @@ class LiteLLMClient(LightevalModel):
         return stop_sequence or None
 
     @staticmethod
-    def _encode_image_base64(image) -> str:
-        """Encode a PIL image as a base64 data URI for OpenAI-style image_url content."""
-        buffer = io.BytesIO()
-        image.save(buffer, format="PNG")
-        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return f"data:image/png;base64,{encoded}"
-
-    def _prepare_multimodal_context(self, doc: Doc) -> list[dict]:
-        """Build chat messages with the document's images attached to the main user query.
-
-        Reuses ``prepare_prompt_api`` for the text/few-shot structure, then converts the last
-        (main query) message into a multimodal content list per ``self.prompt_manager.image_placement``.
-        """
-        messages = self.prompt_manager.prepare_prompt_api(doc)
-        image_parts = [
-            {"type": "image_url", "image_url": {"url": self._encode_image_base64(image)}} for image in doc.images
-        ]
-        last_message = messages[-1]
-        last_message["content"] = order_multimodal_content(
-            last_message["content"], image_parts, placement=self.prompt_manager.image_placement
-        )
-        return messages
-
-    @staticmethod
     def _is_o_series_model(model_name: str) -> bool:
         base_model_name = model_name.split("/")[-1].lower()
         return base_model_name.startswith(("o1", "o3", "o4"))
@@ -272,11 +255,11 @@ class LiteLLMClient(LightevalModel):
 
     def _empty_response_after_retries(self, retry_state: RetryCallState) -> LitellmModelResponse:
         """Give up once retries are exhausted: log the last error and degrade to an empty response."""
+        error = retry_state.outcome.exception()
         logger.error(
-            f"API call failed after {self.API_MAX_RETRY} attempts, "
-            f"last error: {retry_state.outcome.exception()!r}. Returning empty response."
+            f"API call failed after {self.API_MAX_RETRY} attempts, last error: {error!r}. Returning empty response."
         )
-        return LitellmModelResponse()
+        return _GaveUp(f"{type(error).__name__}: {error}")
 
     async def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
         """Make API call with retries."""
@@ -329,7 +312,9 @@ class LiteLLMClient(LightevalModel):
                     )
                     if error_string in e.__dict__["message"]:
                         logger.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
+                        filtered = LitellmModelResponse()
+                        filtered.choices[0].finish_reason = "content_filter"
+                        return filtered
                 raise
 
             # If response is empty, retry once without caching (maybe the error is recoverable and solved with a retry)
@@ -441,7 +426,7 @@ class LiteLLMClient(LightevalModel):
             ):
                 # Use split-local docs to avoid issuing full-dataset requests for every split.
                 contexts = [
-                    self._prepare_multimodal_context(doc)
+                    self.prompt_manager.prepare_prompt_api_multimodal(doc)
                     if doc.images
                     else self.prompt_manager.prepare_prompt_api(doc)
                     for doc in split
@@ -466,11 +451,17 @@ class LiteLLMClient(LightevalModel):
                         getattr(choice.message, "reasoning_content", None) for choice in response.choices
                     ]
 
+                    gave_up = isinstance(response, _GaveUp)
                     cur_response = ModelResponse(
                         # In empty responses, the model should return an empty string instead of None
                         text=result if result[0] else [""],
                         reasonings=reasonings,
+                        finish_reasons=[None]
+                        if gave_up
+                        else [getattr(choice, "finish_reason", None) for choice in response.choices],
                         input=context,
+                        error=RequestFailure.RETRIES_EXHAUSTED if gave_up else None,
+                        error_detail=response.detail if gave_up else None,
                     )
                     results.append(cur_response)
 

@@ -37,6 +37,7 @@ from lighteval.models.endpoints.inference_providers_model import (
 )
 from lighteval.models.endpoints.litellm_model import LiteLLMClient, LiteLLMModelConfig
 from lighteval.models.endpoints.tgi_model import ModelClient, TGIModelConfig
+from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIClient, VLLMOpenAIModelConfig
 from lighteval.models.sglang.sglang_model import SGLangModel, SGLangModelConfig
 from lighteval.models.transformers.adapter_model import AdapterModel, AdapterModelConfig
 from lighteval.models.transformers.delta_model import DeltaModel, DeltaModelConfig
@@ -87,8 +88,13 @@ def load_model(  # noqa: C901
     if isinstance(config, LiteLLMModelConfig):
         return load_litellm_model(config)
 
+    if isinstance(config, VLLMOpenAIModelConfig):
+        return load_vllm_openai_model(config)
+
     if isinstance(config, InferenceProvidersModelConfig):
         return load_inference_providers_model(config=config)
+
+    raise ValueError(f"Unknown model config type: {type(config).__name__}")
 
 
 def load_model_with_tgi(config: TGIModelConfig):
@@ -99,6 +105,11 @@ def load_model_with_tgi(config: TGIModelConfig):
 
 def load_litellm_model(config: LiteLLMModelConfig):
     model = LiteLLMClient(config)
+    return model
+
+
+def load_vllm_openai_model(config: VLLMOpenAIModelConfig):
+    model = VLLMOpenAIClient(config)
     return model
 
 
