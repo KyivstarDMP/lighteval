@@ -44,6 +44,7 @@ from lighteval.models.endpoints.vllm_openai_model import (
     VLLMOpenAIModelConfig,
     _AdaptiveLimiter,
     _collect_chat_stream,
+    _Failed,
     _fit_open_files,
     _metrics_url,
     _next_limit,
@@ -53,7 +54,7 @@ from lighteval.models.endpoints.vllm_openai_model import (
     _steer,
 )
 from lighteval.models.model_input import GenerationParameters
-from lighteval.models.model_output import ModelResponse
+from lighteval.models.model_output import ModelResponse, RequestFailure
 from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc
 from lighteval.utils.cache_management import SampleCache
@@ -406,13 +407,15 @@ class TestRetryClassification:
     def test_bad_request_degrades_without_retry(self):
         client = make_client()
         call = AsyncMock(side_effect=_status_error(400))
-        assert run(client._request(call, label="test")) is None
+        assert run(client._request(call, label="test")) == _Failed(RequestFailure.REJECTED, "APIStatusError: boom")
         assert call.await_count == 1
 
     def test_server_error_backs_off_then_degrades(self):
         client = make_client(api_max_retry=3)
         call = AsyncMock(side_effect=_status_error(500))
-        assert run(client._request(call, label="test")) is None
+        assert run(client._request(call, label="test")) == _Failed(
+            RequestFailure.RETRIES_EXHAUSTED, "APIStatusError: boom"
+        )
         assert call.await_count >= 3
 
     def test_rate_limit_backs_off_then_succeeds(self):
@@ -424,18 +427,20 @@ class TestRetryClassification:
     def test_timeout_is_a_stall_degraded_without_retry(self):
         client = make_client(api_max_retry=3)
         call = AsyncMock(side_effect=_timeout_error())
-        assert run(client._request(call, label="test")) is None
+        assert run(client._request(call, label="test")) == _Failed(
+            RequestFailure.STALLED, "APITimeoutError: Request timed out."
+        )
         assert call.await_count == 1
 
     def test_consecutive_stalls_abort_the_run_and_a_success_resets_the_count(self):
         client = make_client()
         stalled = AsyncMock(side_effect=_timeout_error())
         for _ in range(7):
-            assert run(client._request(stalled, label="test")) is None
+            assert run(client._request(stalled, label="test")).reason == "stalled"
         good = make_sdk_chat_response()
         assert run(client._request(AsyncMock(return_value=good), label="test")) is good  # resets
         for _ in range(7):
-            assert run(client._request(stalled, label="test")) is None
+            assert run(client._request(stalled, label="test")).reason == "stalled"
         with pytest.raises(RuntimeError, match="stalled on 8 consecutive"):
             run(client._request(stalled, label="test"))
 
@@ -528,6 +533,19 @@ class TestStreamedGeneration:
             (result,) = client.greedy_until([doc])
         assert result.text == ["final"]
         assert result.reasonings == ["r"]
+        assert result.error is None
+
+    def test_greedy_until_says_why_it_gave_up_on_a_doc(self):
+        client = make_client()
+        doc = Doc(query="Q?", choices=[], gold_index=0, task_name="t", generation_size=8)
+        doc.id = "0"
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(side_effect=_status_error(400))
+        sdk.__aenter__ = AsyncMock(return_value=sdk)
+        sdk.__aexit__ = AsyncMock(return_value=False)
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            (result,) = client.greedy_until([doc])
+        assert (result.text, result.error, result.error_detail) == ([""], "rejected", "APIStatusError: boom")
 
     def test_generation_prompts_are_held_to_the_context_budget_except_images(self):
         pil = pytest.importorskip("PIL.Image")
@@ -616,7 +634,7 @@ class TestContextBudget:
         else:
             sdk.completions.create = AsyncMock(return_value=stream)
             response = run(client._call_api_text_generative(sdk, "Q", None, 1, None))
-        assert response is None
+        assert response.reason == "over_budget"
         assert consumed == [None]
 
     @pytest.mark.parametrize("chat", [True, False])
@@ -758,7 +776,7 @@ class TestStallDetection:
             await asyncio.sleep(30)
 
         sdk.chat.completions.create = never_opens
-        assert run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1)) is None
+        assert run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1)).reason == "stalled"
         assert client._consecutive_stalls == 1
 
     def test_opening_a_stream_waits_while_other_streams_progress(self):
@@ -802,7 +820,7 @@ class TestStallDetection:
         client = make_client()
         timed_out = AsyncMock(side_effect=httpx.ReadTimeout("no bytes"))
         for _ in range(7):
-            assert run(client._request(timed_out, label="test")) is None
+            assert run(client._request(timed_out, label="test")).reason == "stalled"
         with pytest.raises(RuntimeError, match="stalled on 8 consecutive"):
             run(client._request(timed_out, label="test"))
 
@@ -1200,15 +1218,28 @@ class TestTokenIdLoglikelihood:
         assert result.output_tokens == [[ord(" "), ord("c")]]
         assert result.logprobs == pytest.approx([-1.0])
 
-    def test_degraded_request_scores_minus_inf(self):
+    def test_a_degraded_request_scores_minus_inf_and_says_why(self):
         client = _token_client()
-        sdk = MagicMock()
-        sdk.completions.create = AsyncMock(return_value=None)
-        with patch.object(client, "_request", AsyncMock(return_value=None)):
+        stalled = _Failed(RequestFailure.STALLED, "APITimeoutError: Request timed out.")
+        with patch.object(client, "_request", AsyncMock(return_value=stalled)):
             result = run(
-                client._process_doc_token_loglikelihood_async(make_doc("q", [" a"]), sdk, asyncio.Semaphore(1))
+                client._process_doc_token_loglikelihood_async(make_doc("q", [" a"]), MagicMock(), asyncio.Semaphore(1))
             )
         assert result.logprobs == [float("-inf")] and result.argmax_logits_eq_gold == [False]
+        assert (result.error, result.error_detail) == ("stalled", "APITimeoutError: Request timed out.")
+
+    def test_every_server_templated_route_says_why_it_gave_up(self):
+        client = make_client()
+        doc, semaphore = make_doc("q", [" a", " b"]), asyncio.Semaphore(4)
+        answered = make_sdk_completion_response(["q", " a", "x"], [None, -0.5, -0.1], text_offset=[0, 1, 3])
+        over_budget, gave_up = _Failed(RequestFailure.OVER_BUDGET, ""), _Failed(RequestFailure.RETRIES_EXHAUSTED, "")
+        with patch.object(client, "_request", AsyncMock(side_effect=[answered, over_budget])):
+            echo = run(client._process_doc_loglikelihood_async(doc, "q", MagicMock(), semaphore))
+        with patch.object(client, "_request", AsyncMock(return_value=gave_up)):
+            chat = run(client._process_doc_chat_loglikelihood_async(doc, MagicMock(), semaphore))
+            rolling = run(client._process_doc_rolling_async(doc, MagicMock(), semaphore))
+        assert (echo.logprobs[1], echo.error) == (float("-inf"), "over_budget")
+        assert (chat.error, rolling.error) == ("retries_exhausted", "retries_exhausted")
 
     def test_images_keep_the_server_templated_chat_route(self):
         client = _token_client()
@@ -1594,7 +1625,9 @@ class TestErrorsInsideAStream:
     def test_an_error_inside_a_stream_is_retried_then_degraded(self):
         client = make_client(api_max_retry=3)
         call = AsyncMock(side_effect=_stream_error())
-        assert run(client._request(call, label="test")) is None
+        assert run(client._request(call, label="test")) == _Failed(
+            RequestFailure.RETRIES_EXHAUSTED, "APIError: Unexpected token 200002 while expecting start token 200006"
+        )
         assert call.await_count >= 3  # the same bound as a 5xx
 
     def test_an_error_inside_a_stream_is_retried_until_the_sample_succeeds(self):
@@ -1617,7 +1650,8 @@ class TestErrorsInsideAStream:
         client = make_client(api_max_retry=2)
         sdk = MagicMock()
         sdk.chat.completions.create = AsyncMock(side_effect=lambda **kwargs: breaks_mid_stream())
-        assert run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1)) is None
+        failed = run(client._call_api_chat_generative(sdk, [{"role": "user", "content": "Q"}], 8, 1))
+        assert failed.reason == "retries_exhausted"
         assert sdk.chat.completions.create.await_count >= 2
 
 

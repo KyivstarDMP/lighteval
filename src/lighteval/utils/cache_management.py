@@ -408,7 +408,7 @@ def cached(sampling_method: SamplingMethod = None):  # noqa C901
                 )
 
             # 2) Process not cached docs and save to file
-            new_results = []
+            failed: dict[int, ModelResponse] = {}
             if docs_not_cached:
                 tasks_needing_sample_processing = {
                     cache.get_task_id(doc.task_name, sampling_method) for doc in docs_not_cached
@@ -417,17 +417,27 @@ def cached(sampling_method: SamplingMethod = None):  # noqa C901
                     f"Cache: Starting to process {len(docs_not_cached)}/{len(docs)} samples (not found in cache) for tasks {','.join(str(t) for t in tasks_needing_sample_processing)}"
                 )
                 new_results = func(self, docs_not_cached, *args, **kwargs)
+                answered = [(doc, result) for doc, result in zip(docs_not_cached, new_results) if not result.error]
+                failed = {id(doc): result for doc, result in zip(docs_not_cached, new_results) if result.error}
+                if failed:
+                    logger.warning(f"Cache: not caching {len(failed)} sample(s) the model failed to answer")
 
                 # Store new results in file cache
                 cache.cache_samples(
-                    docs=docs_not_cached,
-                    results=new_results,
+                    docs=[doc for doc, _ in answered],
+                    results=[result for _, result in answered],
                     task_ids=task_ids,
                     sampling_method=sampling_method,
                 )
 
-            # 3) Create final results by pulling from newly saved file cache
-            final_cached_results = cache.get_samples_from_cache(docs, task_ids, sampling_method)
+            # 3) Create final results by pulling from newly saved file cache, failed samples as they came back
+            to_load = [doc for doc in docs if id(doc) not in failed]
+            loaded = iter(
+                cache.get_samples_from_cache(
+                    to_load, {cache.get_task_id(doc.task_name, sampling_method) for doc in to_load}, sampling_method
+                )
+            )
+            final_cached_results = [failed[id(doc)] if id(doc) in failed else next(loaded) for doc in docs]
 
             # 4) We only keep samples with the correct sampling method
             final_results = [

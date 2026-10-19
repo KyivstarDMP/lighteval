@@ -21,8 +21,23 @@
 # SOFTWARE.
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 import torch
+
+
+class RequestFailure(str, Enum):
+    """Why a backend gave up on a doc's request."""
+
+    OVER_BUDGET = "over_budget"
+    REJECTED = "rejected"
+    STALLED = "stalled"
+    RETRIES_EXHAUSTED = "retries_exhausted"
+
+    @property
+    def retriable(self) -> bool:
+        """Whether asking again later can get an answer."""
+        return self in (RequestFailure.STALLED, RequestFailure.RETRIES_EXHAUSTED)
 
 
 @dataclass
@@ -137,6 +152,8 @@ class ModelResponse:
     # Other metadata
     truncated_tokens_count: int = 0  # How many tokens truncated
     padded_tokens_count: int = 0  # How many tokens of padding
+    error: RequestFailure | None = None  # Why the backend gave up on this doc's request; such a response is not cached
+    error_detail: str | None = None  # The error behind it, e.g. "BadRequestError: Error code: 400 - ..."
 
     @property
     def final_text(self) -> list[str]:

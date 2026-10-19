@@ -63,7 +63,7 @@ from lighteval.models.endpoints.openai_scoring import (
     find_continuation_start,
     pieces_to_text,
 )
-from lighteval.models.model_output import ModelResponse
+from lighteval.models.model_output import ModelResponse, RequestFailure
 from lighteval.tasks.prompt_manager import PromptManager, image_url_parts
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.cache_management import SampleCache, cached
@@ -111,6 +111,22 @@ class _StreamStall(openai.APITimeoutError):
 
 class _OverBudget(Exception):
     """A prompt that a server started at the invocation's context budget would reject."""
+
+
+class _Failed(NamedTuple):
+    """A request the client gave up on; the doc is scored blank and kept out of the sample cache."""
+
+    reason: RequestFailure
+    detail: str
+
+
+def _failure(*responses) -> dict:
+    failed = next((response for response in responses if isinstance(response, _Failed)), None)
+    return {"error": failed.reason, "error_detail": failed.detail} if failed else {}
+
+
+def _describe(error: BaseException) -> str:
+    return f"{type(error).__name__}: {error}"
 
 
 def _hold_prompt(usage, budget: int | None) -> None:
@@ -682,17 +698,18 @@ class VLLMOpenAIClient(LightevalModel):
           being up, and every subsequent request would fail the same way.
         - Timeouts (a stalled stream, see ``_stream_chunks``): no retry — a
           resample of the same prompt stalls the same way — degrade this one
-          request to ``None``; after ``_STALL_ABORT_AFTER`` consecutive stalls
+          request to a ``_Failed``; after ``_STALL_ABORT_AFTER`` consecutive stalls
           the server is dead, **raise**.
         - 429 / 5xx (transient overload), and an error the server reports
           inside a stream (a generation the server could not parse, say):
           exponential backoff up to ``api_max_retry``, then degrade this one
-          request to ``None``.
+          request to a ``_Failed``.
         - Other 4xx (bad request, e.g. context overflow), and a prompt over the
-          context budget: no retry, degrade to ``None`` so one oversized doc
-          doesn't abort a long run.
+          context budget: no retry, degrade to a ``_Failed`` so one oversized
+          doc doesn't abort a long run.
         """
         connect_failures = 0
+        last_error = None
         for attempt in range(self._retry_upper_bound()):
             try:
                 result = await call()
@@ -701,7 +718,7 @@ class VLLMOpenAIClient(LightevalModel):
             except _OverBudget as e:
                 self._consecutive_stalls = 0
                 logger.warning(f"{label}: {e}. Not retrying; degrading this request.")
-                return None
+                return _Failed(RequestFailure.OVER_BUDGET, str(e))
             except (openai.APITimeoutError, httpx.TimeoutException) as e:
                 self._consecutive_stalls += 1
                 if self._consecutive_stalls >= _STALL_ABORT_AFTER:
@@ -710,8 +727,9 @@ class VLLMOpenAIClient(LightevalModel):
                         f"requests ({e}); aborting the evaluation."
                     ) from e
                 logger.error(f"Stall on {label}: {e}. Not retrying; degrading this request.")
-                return None
+                return _Failed(RequestFailure.STALLED, _describe(e))
             except openai.APIConnectionError as e:
+                last_error = e
                 connect_failures += 1
                 if connect_failures > _CONNECT_RETRIES:
                     raise RuntimeError(
@@ -720,20 +738,22 @@ class VLLMOpenAIClient(LightevalModel):
                 logger.warning(f"Connection failure on {label}: {e} — retrying in {_CONNECT_RETRY_SLEEP_S}s")
                 await asyncio.sleep(_CONNECT_RETRY_SLEEP_S)
             except openai.APIStatusError as e:
+                last_error = e
                 if e.status_code == 429 or e.status_code >= 500:
                     wait_time = self._backoff(attempt)
                     logger.warning(f"HTTP {e.status_code} on {label} — backing off {wait_time:.1f}s")
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"HTTP {e.status_code} on {label}: {e}. Not retrying; degrading this request.")
-                    return None
+                    return _Failed(RequestFailure.REJECTED, _describe(e))
             except openai.APIError as e:
+                last_error = e
                 wait_time = self._backoff(attempt)
                 logger.warning(f"Server error in the {label} stream: {e} — retrying in {wait_time:.1f}s")
                 await asyncio.sleep(wait_time)
 
         logger.error(f"{label} failed after {self.API_MAX_RETRY} attempts; degrading this request.")
-        return None
+        return _Failed(RequestFailure.RETRIES_EXHAUSTED, _describe(last_error))
 
     def _backoff(self, attempt: int) -> float:
         return min(64.0, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt))
@@ -919,7 +939,9 @@ class VLLMOpenAIClient(LightevalModel):
 
                     for context, response in pairs:
                         if response is None or not getattr(response, "choices", None):
-                            results.append(ModelResponse(text=[""], reasonings=[None], input=context))
+                            results.append(
+                                ModelResponse(text=[""], reasonings=[None], input=context, **_failure(response))
+                            )
                             continue
                         if use_chat_template:
                             result = [choice.message.content for choice in response.choices]
@@ -1027,6 +1049,7 @@ class VLLMOpenAIClient(LightevalModel):
             input=context_str,
             logprobs=logprobs_per_choice,
             argmax_logits_eq_gold=argmax_per_choice,
+            **_failure(*responses),
         )
 
     # ------------------------------------------------------------------
@@ -1092,6 +1115,7 @@ class VLLMOpenAIClient(LightevalModel):
             output_tokens=[list(ids) for ids in continuation_ids],
             logprobs=logprobs_per_choice,
             argmax_logits_eq_gold=argmax_per_choice,
+            **_failure(*responses),
         )
 
     # ------------------------------------------------------------------
@@ -1209,6 +1233,7 @@ class VLLMOpenAIClient(LightevalModel):
             input=str(context_messages),
             logprobs=logprobs_per_choice,
             argmax_logits_eq_gold=argmax_per_choice,
+            **_failure(*responses),
         )
 
     # ------------------------------------------------------------------
@@ -1294,7 +1319,7 @@ class VLLMOpenAIClient(LightevalModel):
             response = await self._call_api_text_completion_async(client, doc_text)
 
         if response is None or not getattr(response, "choices", None):
-            return ModelResponse(input=doc_text, logprobs=[float("-inf")])
+            return ModelResponse(input=doc_text, logprobs=[float("-inf")], **_failure(response))
 
         lp_obj = getattr(response.choices[0], "logprobs", None)
         if lp_obj is None or not getattr(lp_obj, "token_logprobs", None):
