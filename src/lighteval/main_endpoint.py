@@ -356,8 +356,8 @@ def vllm_openai(
 
     Talks to the server directly through the OpenAI SDK — no provider routing.
     Supports chat-templated and plain-text generation, and loglikelihood
-    scoring for both (chat-templated LL uses vLLM's ``prompt_logprobs``
-    chat-completions extension, incl. multimodal docs).
+    scoring for both (text LL from client-side token ids by default; docs with
+    images use vLLM's ``prompt_logprobs`` chat-completions extension).
 
     Returns:
         dict: Evaluation results containing metrics and scores for all tasks

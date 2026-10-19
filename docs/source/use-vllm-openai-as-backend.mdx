@@ -18,11 +18,12 @@ lighteval endpoint vllm-openai \
 |------|--------|-------|
 | **Generative (chat)** | `greedy_until` with `use_chat_template=true` (default) | `POST /v1/chat/completions` |
 | **Generative (plain text)** | `greedy_until` with `use_chat_template=false` (base models) | `POST /v1/completions` |
-| **Log-likelihood, chat-templated** (text **and** vision) | `loglikelihood` with `use_chat_template=true` | `POST /v1/chat/completions` with vLLM's `prompt_logprobs` + `continue_final_message` extensions |
-| **Log-likelihood, plain text** | `loglikelihood` with `use_chat_template=false` | `POST /v1/completions` with `echo=True`, `logprobs=1` |
+| **Log-likelihood, text** | `loglikelihood` with `client_tokenization=true` (default) | `POST /v1/completions` with client-side token ids, `echo=True`, `logprobs=1` |
+| **Log-likelihood, chat-templated** (vision, or text with `client_tokenization=false`) | `loglikelihood` with `use_chat_template=true` | `POST /v1/chat/completions` with vLLM's `prompt_logprobs` + `continue_final_message` extensions |
+| **Log-likelihood, plain text** (`client_tokenization=false`) | `loglikelihood` with `use_chat_template=false` | `POST /v1/completions` with `echo=True`, `logprobs=1` |
 | **Rolling log-likelihood (perplexity)** | `loglikelihood_rolling` | `POST /v1/completions` with `echo=True` |
 
-Chat-templated loglikelihood scores each choice as an *unterminated assistant
+The chat-templated route scores each choice as an *unterminated assistant
 reply*: the server renders its chat template with
 `continue_final_message=true`, so the scored prompt ends exactly with the
 continuation, and the continuation tokens are isolated by suffix-aligning the

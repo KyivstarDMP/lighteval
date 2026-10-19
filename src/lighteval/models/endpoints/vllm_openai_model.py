@@ -28,11 +28,15 @@ prefixes) and leans on vLLM-specific API extensions:
 
 - generative requests forward sampling parameters LiteLLM drops
   (``top_k``, ``min_p``, ``repetition_penalty``) and ``chat_template_kwargs``;
-- chat-templated loglikelihood (text and vision) scores each choice as an
-  unterminated assistant reply via ``prompt_logprobs`` +
-  ``continue_final_message``;
-- plain-text loglikelihood and rolling perplexity use ``/v1/completions``
-  with ``echo=True``.
+- text loglikelihood is scored from token ids the client builds (chat
+  template rendered locally when ``use_chat_template``) over
+  ``/v1/completions`` with ``echo=True``;
+- vision loglikelihood, and chat-templated text with ``client_tokenization``
+  off, scores each choice as an unterminated assistant reply via
+  ``prompt_logprobs`` + ``continue_final_message``;
+- rolling perplexity, and plain-text loglikelihood with
+  ``client_tokenization`` off, send text the server tokenizes to
+  ``/v1/completions`` with ``echo=True``.
 
 Retry semantics are local-server-appropriate: a connection failure means the
 server died (fail fast and abort), while overload (429/5xx/timeouts) backs off
