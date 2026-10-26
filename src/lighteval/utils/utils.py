@@ -306,6 +306,7 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
     result = text
 
     for start_tag, end_tag in tag_pairs:
+        closed = end_tag in result
         while start_tag in result and end_tag in result:
             start = result.find(start_tag)
             end = result.find(end_tag, start)
@@ -317,5 +318,9 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
         # all reasoning: score it as an empty answer, as server-side parsers do.
         if start_tag and start_tag in result:
             result = result[: result.find(start_tag)]
+        # An empty start tag means the chat template opens the span in the prompt
+        # (Qwen3.5): an output that never closes it is all reasoning as well.
+        elif not start_tag and not closed:
+            result = ""
 
     return result

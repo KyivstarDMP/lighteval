@@ -65,6 +65,9 @@ class TestRemoveReasoningTags(unittest.TestCase):
     def test_unclosed_span_after_a_closed_one(self):
         self.assertEqual(remove_reasoning_tags("<think>a</think>Answer<think>b", [("<think>", "</think>")]), "Answer")
 
-    def test_empty_start_tag_never_wipes_the_answer(self):
+    def test_empty_start_tag_keeps_the_answer_after_its_closer(self):
         self.assertEqual(remove_reasoning_tags("Reasoning</think>Answer", [("", "</think>")]), "Answer")
-        self.assertEqual(remove_reasoning_tags("No closing tag", [("", "</think>")]), "No closing tag")
+
+    def test_empty_start_tag_without_a_closer_is_all_reasoning(self):
+        # the chat template opened the span in the prompt, and the output never closed it (budget exhausted)
+        self.assertEqual(remove_reasoning_tags("No closing tag", [("", "</think>")]), "")
