@@ -76,6 +76,15 @@ class TestGenerationParameters:
 
         assert gen.to_vllm_dict() == {"max_tokens": 128, "temperature": 0.1, "skip_special_tokens": False}
 
+    def test_a_thinking_budget_reaches_vllm_but_not_litellm(self):
+        gen = GenerationParameters(
+            max_new_tokens=128, temperature=0.1, thinking_token_budget=2048, reasoning_effort="low"
+        )
+
+        assert gen.to_vllm_dict() == {"max_tokens": 128, "temperature": 0.1, "thinking_token_budget": 2048}
+        assert gen.to_vllm_openai_dict() == {"max_new_tokens": 128, "temperature": 0.1, "thinking_token_budget": 2048}
+        assert "thinking_token_budget" not in gen.to_litellm_dict()
+
     def test_vllm_openai_dict_excludes_reasoning_effort(self):
         gen = GenerationParameters(max_new_tokens=128, temperature=0.1, reasoning_effort="low")
 

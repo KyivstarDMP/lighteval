@@ -56,6 +56,9 @@ class GenerationParameters(BaseModel, extra="forbid"):
     # Provider-agnostic reasoning control for litellm; litellm maps it to each provider's
     # native format (e.g., OpenAI reasoning_effort, Anthropic thinking, Google thinkingBudget).
     reasoning_effort: str | None = None  # litellm
+    # Tokens a thought may take before its closer is forced: a reasoning model's thinking budget. vLLM needs the model's
+    # `reasoning_config` (what opens and closes a thought) to apply it.
+    thinking_token_budget: NonNegativeInt | None = None  # vllm
 
     @classmethod
     def from_dict(cls, config_dict: dict):
