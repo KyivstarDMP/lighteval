@@ -23,7 +23,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 import torch
 import yaml
@@ -90,6 +90,9 @@ class ModelConfig(BaseModel, extra="forbid"):
     chat_template_kwargs: dict[str, Any] = Field(default_factory=dict)
     image_placement: ImagePlacement = ImagePlacement.inline
     cache_dir: str = "~/.cache/huggingface/lighteval"
+    # How the model samples, where its configuration doesn't show it: part of the response cache's identity, so a
+    # change to it never reuses responses sampled before (None: nothing beyond the configuration)
+    cache_version: ClassVar[str | None] = None
 
     @classmethod
     def from_path(cls, path: str):

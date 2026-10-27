@@ -27,7 +27,7 @@ import hashlib
 import itertools
 import logging
 import os
-from typing import Coroutine, Optional
+from typing import ClassVar, Coroutine, Optional
 
 import torch
 from pydantic import NonNegativeFloat, NonNegativeInt, PositiveInt
@@ -59,19 +59,41 @@ def build_vllm_token_prompts(inputs: list) -> list:
     return [item if isinstance(item, dict) else TokensPrompt(prompt_token_ids=item) for item in inputs]
 
 
+# How each request's seed is made. A new value whenever that changes: it is part of the response cache's identity
+# (``VLLMModelConfig.cache_version``), so responses sampled under another scheme are never reused.
+REQUEST_SEEDS = "sha256 of the run seed and the request: its token ids, or its text and image pixels"
+
+
 def request_seeds(seed: int, inputs: list) -> list[int]:
-    """Return one sampling seed per request, from the run's seed and the request's prompt.
+    """Return one sampling seed per request, from the run's seed and the request.
 
     vLLM gives each seeded request its own generator, so requests that share a seed draw the same noise at every
     step and their samples are correlated: a run is not a set of independent samples, and changing the seed moves
-    every row the same way. A seed per prompt keeps a run reproducible (a prompt draws the same noise in every run
-    with this seed, whatever the batch) while different prompts draw different noise.
+    every row the same way. With a seed per request, different requests draw different noise, and a request draws
+    the same noise in every run with this seed, whatever the batch (its output can still differ, since vLLM's
+    numerics depend on the batch). A request is its token ids, or a multimodal prompt's text and images, so image
+    questions that share their text don't share their noise.
     """
-    seeds = []
-    for item in inputs:
-        key = item.get("prompt", "") if isinstance(item, dict) else ",".join(map(str, item))
-        seeds.append(int.from_bytes(hashlib.sha256(f"{seed}:{key}".encode()).digest()[:4], "big"))
-    return seeds
+    return [
+        int.from_bytes(hashlib.sha256(f"{seed}:{_request_key(item)}".encode()).digest()[:4], "big") for item in inputs
+    ]
+
+
+def _request_key(item) -> str:
+    if not isinstance(item, dict):
+        return ",".join(map(str, item))  # token ids
+    images = (item.get("multi_modal_data") or {}).get("image") or []
+    images = images if isinstance(images, (list, tuple)) else [images]
+    return item.get("prompt", "") + "".join(f"\0{_image_digest(image)}" for image in images)
+
+
+def _image_digest(image) -> str:
+    """Return a digest of an image's pixels (a PIL image), else of its bytes."""
+    if hasattr(image, "tobytes"):
+        data = f"{image.mode}:{image.size}:".encode() + image.tobytes()
+    else:
+        data = bytes(image) if isinstance(image, (bytes, bytearray)) else repr(image).encode()
+    return hashlib.sha256(data).hexdigest()
 
 
 def _with_seed(sampling_params, seed: int):
@@ -196,6 +218,7 @@ class VLLMModelConfig(ModelConfig):
     """
 
     model_name: str
+    cache_version: ClassVar[str | None] = REQUEST_SEEDS  # a seeded run's responses depend on how requests are seeded
     tokenizer: str | None = None
     revision: str = "main"  # revision of the model
     dtype: str = "bfloat16"
@@ -741,13 +764,20 @@ class AsyncVLLMModel(VLLMModel):
             sampling_params.logprobs = int(doc.use_logits)
             prompt = base_prompt
             index_str = f"generative_{index}"
-            if sampling_params.seed is not None:
-                sampling_params.seed = request_seeds(sampling_params.seed, [prompt])[0]
 
         if doc.images:
             # Attach the images so vLLM's HF processor fuses them with the placeholder
             # tokens already present in ``base_prompt``.
             prompt = self._multimodal_prompt(prompt, doc)
+
+        if generative and sampling_params.seed is not None:
+            # the batch path's request: the prompt's token ids, or the multimodal prompt with its images
+            request = (
+                prompt
+                if isinstance(prompt, dict)
+                else self.tokenizer(prompt, add_special_tokens=self.add_special_tokens)["input_ids"]
+            )
+            sampling_params.seed = request_seeds(sampling_params.seed, [request])[0]
 
         generator = self.model.generate(request_id=index_str, prompt=prompt, sampling_params=sampling_params)
         try:

@@ -146,6 +146,8 @@ class SampleCache:
         """
         # Use Pydantic's model_dump instead of asdict for BaseModel
         config_dict = model_config.model_dump()
+        if getattr(model_config, "cache_version", None):  # how the model samples, beyond its configuration
+            config_dict["cache_version"] = model_config.cache_version
         config_str = json.dumps(config_dict, sort_keys=True, default=str)
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 

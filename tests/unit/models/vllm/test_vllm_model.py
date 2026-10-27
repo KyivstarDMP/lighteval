@@ -190,6 +190,57 @@ class TestVLLMRequestSeeds(unittest.TestCase):
         self.assertNotEqual(seeds, request_seeds(2, prompts))  # another run seed, other noise
         self.assertTrue(all(0 <= seed < 2**32 for seed in seeds))
 
+    def test_image_requests_with_the_same_text_draw_their_own_seeds(self):
+        from lighteval.models.vllm.vllm_model import request_seeds
+
+        red, blue = Image.new("RGB", (4, 4), "red"), Image.new("RGB", (4, 4), "blue")
+        text = "Question <start_of_image>"  # MMMU-Pro vision: the question is in the image
+        requests = [{"prompt": text, "multi_modal_data": {"image": [image]}} for image in (red, blue, red.copy())]
+        seeds = request_seeds(1, requests)
+        self.assertNotEqual(seeds[0], seeds[1])  # the same text, other pixels
+        self.assertEqual(seeds[0], seeds[2])  # the same pixels
+        no_images = [{"prompt": text}, {"prompt": text, "multi_modal_data": {"image": []}}]
+        self.assertEqual(len(set(request_seeds(1, no_images))), 1)
+
+    def test_async_requests_are_seeded_as_the_batch_path_seeds_them(self):
+        import asyncio
+
+        from lighteval.models.vllm import vllm_model
+
+        class FakeSamplingParams:
+            def __init__(self, **kwargs):
+                self.__dict__.update({"seed": None, "temperature": 1.0, **kwargs})
+
+        sent = {}
+
+        async def generate(request_id, prompt, sampling_params):
+            sent[request_id] = (prompt, sampling_params.seed)
+            yield "out"
+
+        model = object.__new__(vllm_model.AsyncVLLMModel)
+        model.config = Mock()
+        model.config.generation_parameters.to_vllm_dict.return_value = {"seed": 7, "temperature": 1.0}
+        model.config.generation_parameters.max_new_tokens = 8
+        model.prompt_manager = Mock()
+        model.prompt_manager.prepare_prompt.return_value = "Hello"
+        model.prompt_manager.prepare_prompt_multimodal.return_value = "Look <start_of_image>"
+        model._tokenizer = Mock(return_value={"input_ids": [5, 6]})
+        model._add_special_tokens = False
+        model.use_chat_template = True
+        model.model = Mock()
+        model.model.generate = generate
+        image = Image.new("RGB", (4, 4), "red")
+        with patch.object(vllm_model, "SamplingParams", FakeSamplingParams, create=True):
+            asyncio.run(model._async_one_item(0, Doc(query="Hello", choices=[], gold_index=0), generative=True))
+            asyncio.run(
+                model._async_one_item(1, Doc(query="Look", choices=[], gold_index=0, images=[image]), generative=True)
+            )
+
+        self.assertEqual(sent["generative_0"][1], vllm_model.request_seeds(7, [[5, 6]])[0])
+        image_prompt, image_seed = sent["generative_1"]
+        self.assertEqual(image_seed, vllm_model.request_seeds(7, [image_prompt])[0])
+        self.assertEqual(image_prompt["multi_modal_data"]["image"], [image])
+
     def test_generate_sends_one_seeded_sampling_params_per_request(self):
         from lighteval.models.vllm import vllm_model
 
