@@ -157,18 +157,22 @@ class ModelConfig(BaseModel, extra="forbid"):
                 return None
             return _parse_inline_dict(match.group(1))
 
-        # Looking for generation_parameters and chat_template_kwargs in the model_args
+        # Looking for generation_parameters, chat_template_kwargs and reasoning_config in the model_args
         generation_parameters_dict = _extract_inline_dict(args, "generation_parameters")
         chat_template_kwargs_dict = _extract_inline_dict(args, "chat_template_kwargs")
+        reasoning_config_dict = _extract_inline_dict(args, "reasoning_config")
 
         args = re.sub(r"generation_parameters=\{.*?\},?", "", args).strip(",")
         args = re.sub(r"chat_template_kwargs=\{.*?\},?", "", args).strip(",")
+        args = re.sub(r"reasoning_config=\{.*?\},?", "", args).strip(",")
         model_config = {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in args.split(",")}
 
         if generation_parameters_dict is not None:
             model_config["generation_parameters"] = generation_parameters_dict
         if chat_template_kwargs_dict is not None:
             model_config["chat_template_kwargs"] = chat_template_kwargs_dict
+        if reasoning_config_dict is not None:
+            model_config["reasoning_config"] = reasoning_config_dict
 
         return model_config
 

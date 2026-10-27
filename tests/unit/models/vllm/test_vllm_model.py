@@ -318,6 +318,9 @@ class TestVLLMThinkingBudget(unittest.TestCase):
         self.assertEqual(self._model(max_new_tokens=3000, thinking_token_budget=2048)._max_new_tokens(1280), 3000)
         self.assertEqual(self._model(thinking_token_budget=2048)._max_new_tokens(15), 2067)
         self.assertEqual(self._model(max_new_tokens=10240, thinking_token_budget=2048)._max_new_tokens(None), 10240)
+        # a task that sets no room (generation_size=-1) adds nothing to the budget: the configured limit stands
+        self.assertEqual(self._model(max_new_tokens=10240, thinking_token_budget=2048)._max_new_tokens(-1), 10240)
+        self.assertEqual(self._model(thinking_token_budget=2048)._max_new_tokens(-1), -1)  # as without a budget
 
     def test_greedy_until_asks_each_split_for_its_own_limit(self):
         model = self._model(max_new_tokens=10240, thinking_token_budget=512)
@@ -393,3 +396,21 @@ class TestVLLMThinkingBudget(unittest.TestCase):
         with patch.dict(sys.modules, modules):
             model._create_auto_model(VLLMModelConfig(model_name="m", data_parallel_size=2))
         self.assertNotIn("async_scheduling", model.model_args)  # no budget: vLLM's default
+        model = VLLMModel.__new__(VLLMModel)
+        model._max_length = 4096
+        with (
+            patch.dict(sys.modules, modules),
+            patch.object(vllm_model, "_budget_reads_unfilled_outputs", return_value=True),
+        ):
+            model._create_auto_model(
+                VLLMModelConfig(model_name="m", data_parallel_size=2, reasoning_config=self.GEMMA)
+            )
+        self.assertNotIn("async_scheduling", model.model_args)  # markers without a budget: vLLM's default too
+
+    def test_inline_model_args_carry_a_reasoning_config(self):
+        config = VLLMModelConfig.from_args(
+            'model_name=m,reasoning_config={reasoning_start_str:"<think>",reasoning_end_str:"</think>"},'
+            "generation_parameters={thinking_token_budget:512}"
+        )
+        self.assertEqual(config.reasoning_config, {"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"})
+        self.assertEqual(config.generation_parameters.thinking_token_budget, 512)

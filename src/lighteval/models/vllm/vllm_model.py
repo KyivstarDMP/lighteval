@@ -223,7 +223,8 @@ class VLLMModelConfig(ModelConfig):
             What opens and closes the model's thought, as vLLM's `ReasoningConfig` takes them
             (`reasoning_start_str`, `reasoning_end_str`). Needed for `generation_parameters.thinking_token_budget`:
             vLLM counts a thought's tokens from the opener and, at the budget, forces the closer. The closer is also
-            how vLLM tells that a thought closed by itself, so give the bare closer.
+            how vLLM tells that a thought closed by itself, so give the bare closer. In inline model args, quote the
+            strings: `reasoning_config={reasoning_start_str:"<think>",reasoning_end_str:"</think>"}`.
 
     Example:
         ```python
@@ -388,7 +389,8 @@ class VLLMModel(LightevalModel):
             from vllm.config import ReasoningConfig
 
             self.model_args["reasoning_config"] = ReasoningConfig(**config.reasoning_config)
-            if _budget_reads_unfilled_outputs():
+            # only a budget reads the outputs; a reasoning config without one keeps vLLM's scheduling
+            if config.generation_parameters.thinking_token_budget is not None and _budget_reads_unfilled_outputs():
                 self.model_args["async_scheduling"] = False
 
         if config.data_parallel_size > 1:
@@ -423,7 +425,7 @@ class VLLMModel(LightevalModel):
         """
         configured = self.config.generation_parameters.max_new_tokens
         budget = self.config.generation_parameters.thinking_token_budget
-        if budget is None or room is None:
+        if budget is None or room is None or room <= 0:  # no budget, or no task room (-1 means none)
             return configured or room
         limit = budget + self._thought_marker_tokens() + room
         return min(configured, limit) if configured else limit
