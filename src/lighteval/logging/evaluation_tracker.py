@@ -241,7 +241,10 @@ class EvaluationTracker:
     @property
     def results(self):
         config_general = asdict(self.general_config_logger)
-        config_general["model_config"] = config_general["model_config"].model_dump()
+        model_config = config_general["model_config"]
+        config_general["model_config"] = model_config.model_dump()
+        if getattr(model_config, "cache_version", None):  # how the model samples (vLLM: how requests are seeded)
+            config_general["model_config"]["cache_version"] = model_config.cache_version
         results = {
             "config_general": config_general,
             "results": self.metrics_logger.metric_aggregated,

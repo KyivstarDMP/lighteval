@@ -532,3 +532,14 @@ class TestProperties(unittest.TestCase):
                 for k, v in ref_config.items():
                     with self.subTest(model_config=model_config, model_property=k):
                         self.assertEqual(results["config_general"]["model_config"][k], v)
+
+    def test_a_vllm_run_records_how_its_requests_are_seeded(self):
+        from lighteval.models.vllm.vllm_model import REQUEST_SEEDS
+
+        for model_config, expected in ((self.vllm_config, REQUEST_SEEDS), (self.transformers_config, None)):
+            with self.subTest(model_config=type(model_config).__name__):
+                with tempfile.TemporaryDirectory() as tmp_dir:
+                    evaluation_tracker = EvaluationTracker(output_dir=tmp_dir)
+                    evaluation_tracker.general_config_logger.log_model_info(model_config=model_config)
+                    saved = evaluation_tracker.results["config_general"]["model_config"]
+                self.assertEqual(saved.get("cache_version"), expected)
