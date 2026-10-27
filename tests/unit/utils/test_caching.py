@@ -101,6 +101,24 @@ class TestCaching(unittest.TestCase):
                     self.assertIn(str(temp_dir), str(folder))
                     self.assertIn(model_name, str(folder))
 
+    def test_a_config_cache_version_is_part_of_the_model_hash(self):
+        import hashlib
+        import json
+
+        from lighteval.models.vllm.vllm_model import REQUEST_SEEDS, VLLMModelConfig
+
+        config = VLLMModelConfig(model_name="m")
+        dump = config.model_dump()
+        self.assertNotIn("cache_version", dump)  # not a setting: how this model samples
+
+        def digest(value):
+            return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+        cache = object.__new__(SampleCache)
+        # responses cached before the request seeds (the configuration alone) are not found again
+        self.assertNotEqual(cache.get_model_hash(config), digest(dump))
+        self.assertEqual(cache.get_model_hash(config), digest({**dump, "cache_version": REQUEST_SEEDS}))
+
     def test_cache_decorator_presence(self):
         """Test that @cached decorators are present on the right methods."""
         from lighteval.models.dummy.dummy_model import DummyModel
