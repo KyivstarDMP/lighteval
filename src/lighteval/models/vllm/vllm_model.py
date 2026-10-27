@@ -68,11 +68,11 @@ def request_seeds(seed: int, inputs: list) -> list[int]:
     """Return one sampling seed per request, from the run's seed and the request.
 
     vLLM gives each seeded request its own generator, so requests that share a seed draw the same noise at every
-    step and their samples are correlated: a run is not a set of independent samples, and changing the seed moves
-    every row the same way. With a seed per request, different requests draw different noise, and a request draws
-    the same noise in every run with this seed, whatever the batch (its output can still differ, since vLLM's
-    numerics depend on the batch). A request is its token ids, or a multimodal prompt's text and images, so image
-    questions that share their text don't share their noise.
+    step: their samples are coupled rather than independent. Here a request's seed is a hash of the run's seed and
+    the request, so a request draws the same noise in every run with this seed, whatever the batch (its output can
+    still differ, since vLLM's numerics depend on the batch). Identical requests share their seed; distinct ones
+    get different seeds unless their 32-bit hashes collide. A request is its token ids, or a multimodal prompt's
+    text and images, so image questions that share their text don't share their noise.
     """
     return [
         int.from_bytes(hashlib.sha256(f"{seed}:{_request_key(item)}".encode()).digest()[:4], "big") for item in inputs
