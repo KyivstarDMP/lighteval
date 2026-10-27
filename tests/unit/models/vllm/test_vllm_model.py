@@ -202,6 +202,18 @@ class TestVLLMRequestSeeds(unittest.TestCase):
         no_images = [{"prompt": text}, {"prompt": text, "multi_modal_data": {"image": []}}]
         self.assertEqual(len(set(request_seeds(1, no_images))), 1)
 
+    def test_palette_images_with_the_same_indices_but_other_colours_draw_their_own_seeds(self):
+        from lighteval.models.vllm.vllm_model import request_seeds
+
+        red, blue = Image.new("P", (4, 4)), Image.new("P", (4, 4))
+        red.putpalette([255, 0, 0] * 256)
+        blue.putpalette([0, 0, 255] * 256)
+        self.assertEqual(red.tobytes(), blue.tobytes())  # the same palette indices
+        text = "Question <start_of_image>"
+        requests = [{"prompt": text, "multi_modal_data": {"image": [image]}} for image in (red, blue)]
+        seeds = request_seeds(1, requests)
+        self.assertNotEqual(seeds[0], seeds[1])
+
     def test_async_requests_are_seeded_as_the_batch_path_seeds_them(self):
         import asyncio
 

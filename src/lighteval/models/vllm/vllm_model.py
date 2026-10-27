@@ -90,6 +90,8 @@ def _request_key(item) -> str:
 def _image_digest(image) -> str:
     """Return a digest of an image's pixels (a PIL image), else of its bytes."""
     if hasattr(image, "tobytes"):
+        if getattr(image, "mode", None) in ("P", "PA"):
+            image = image.convert("RGBA")  # palette indices alone don't say the colours
         data = f"{image.mode}:{image.size}:".encode() + image.tobytes()
     else:
         data = bytes(image) if isinstance(image, (bytes, bytearray)) else repr(image).encode()
