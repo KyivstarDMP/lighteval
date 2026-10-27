@@ -21,7 +21,9 @@
 # SOFTWARE.
 
 import asyncio
+import copy
 import gc
+import hashlib
 import itertools
 import logging
 import os
@@ -55,6 +57,27 @@ def build_vllm_token_prompts(inputs: list) -> list:
     from vllm.inputs import TokensPrompt
 
     return [item if isinstance(item, dict) else TokensPrompt(prompt_token_ids=item) for item in inputs]
+
+
+def request_seeds(seed: int, inputs: list) -> list[int]:
+    """Return one sampling seed per request, from the run's seed and the request's prompt.
+
+    vLLM gives each seeded request its own generator, so requests that share a seed draw the same noise at every
+    step and their samples are correlated: a run is not a set of independent samples, and changing the seed moves
+    every row the same way. A seed per prompt keeps a run reproducible (a prompt draws the same noise in every run
+    with this seed, whatever the batch) while different prompts draw different noise.
+    """
+    seeds = []
+    for item in inputs:
+        key = item.get("prompt", "") if isinstance(item, dict) else ",".join(map(str, item))
+        seeds.append(int.from_bytes(hashlib.sha256(f"{seed}:{key}".encode()).digest()[:4], "big"))
+    return seeds
+
+
+def _with_seed(sampling_params, seed: int):
+    params = copy.deepcopy(sampling_params)
+    params.seed = seed
+    return params
 
 
 if is_package_available("vllm"):
@@ -496,20 +519,24 @@ class VLLMModel(LightevalModel):
                 max_tokens=1,
                 detokenize=False,
             )
+        if generate and sampling_params.seed is not None:
+            sampling_params = [
+                _with_seed(sampling_params, seed) for seed in request_seeds(sampling_params.seed, inputs)
+            ]
+        per_request = sampling_params if isinstance(sampling_params, list) else [sampling_params] * len(inputs)
 
         if self.data_parallel_size > 1:
 
             @ray.remote(num_gpus=self.tensor_parallel_size)
-            def run_inference_one_model(model_args: dict, sampling_params: SamplingParams, requests):
+            def run_inference_one_model(model_args: dict, requests):
                 llm = LLM(**model_args)
-                prompts = build_vllm_token_prompts(requests)
-                return llm.generate(prompts=prompts, sampling_params=sampling_params)
+                prompts = build_vllm_token_prompts([prompt for prompt, _ in requests])
+                return llm.generate(prompts=prompts, sampling_params=[params for _, params in requests])
 
             # dispatch requests to all self.data_parallel_size workers, in interleaved fashion
             # interleaved important to balance context lengths across workers
-            requests = [list(x) for x in distribute(self.data_parallel_size, inputs)]
-            inputs = ((self.model_args, sampling_params, req) for req in requests)
-            object_refs = [run_inference_one_model.remote(*x) for x in inputs]
+            requests = [list(x) for x in distribute(self.data_parallel_size, list(zip(inputs, per_request)))]
+            object_refs = [run_inference_one_model.remote(self.model_args, req) for req in requests]
             results = ray.get(object_refs)
             # Invoke ray.shutdown() to prevent hang-ups if subsequent calls required.
             ray.shutdown()
@@ -714,6 +741,8 @@ class AsyncVLLMModel(VLLMModel):
             sampling_params.logprobs = int(doc.use_logits)
             prompt = base_prompt
             index_str = f"generative_{index}"
+            if sampling_params.seed is not None:
+                sampling_params.seed = request_seeds(sampling_params.seed, [prompt])[0]
 
         if doc.images:
             # Attach the images so vLLM's HF processor fuses them with the placeholder

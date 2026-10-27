@@ -176,3 +176,39 @@ class TestVLLMMultimodalPayload(unittest.TestCase):
             self.assertIsInstance(payload, dict)
             self.assertTrue(payload["prompt"].startswith("Question <start_of_image>"))
             self.assertEqual(payload["multi_modal_data"]["image"], [image])
+
+
+class TestVLLMRequestSeeds(unittest.TestCase):
+    def test_each_prompt_gets_its_own_reproducible_seed(self):
+        from lighteval.models.vllm.vllm_model import request_seeds
+
+        prompts = [[1, 2, 3], [4, 5], [1, 2, 3], {"prompt": "Question <start_of_image>"}]
+        seeds = request_seeds(1, prompts)
+        self.assertEqual(seeds, request_seeds(1, prompts))  # reproducible
+        self.assertEqual(seeds[0], seeds[2])  # the same prompt draws the same noise
+        self.assertEqual(len({seeds[0], seeds[1], seeds[3]}), 3)  # different prompts don't
+        self.assertNotEqual(seeds, request_seeds(2, prompts))  # another run seed, other noise
+        self.assertTrue(all(0 <= seed < 2**32 for seed in seeds))
+
+    def test_generate_sends_one_seeded_sampling_params_per_request(self):
+        from lighteval.models.vllm import vllm_model
+
+        class FakeSamplingParams:
+            def __init__(self, **kwargs):
+                self.__dict__.update({"seed": None, "temperature": 1.0, **kwargs})
+
+        model = object.__new__(vllm_model.VLLMModel)
+        model.config = Mock()
+        model.config.generation_parameters.to_vllm_dict.return_value = {"seed": 7, "temperature": 1.0}
+        model.data_parallel_size = 1
+        model.model = Mock()
+        model.model.generate.return_value = ["out-a", "out-b"]
+        with (
+            patch.dict(sys.modules, TestVLLMPromptConstruction._fake_vllm_modules()),
+            patch.object(vllm_model, "SamplingParams", FakeSamplingParams, create=True),
+        ):
+            model._generate([[1, 2], [3]], max_new_tokens=8)
+
+        sent = model.model.generate.call_args.kwargs["sampling_params"]
+        self.assertEqual([params.seed for params in sent], vllm_model.request_seeds(7, [[1, 2], [3]]))
+        self.assertTrue(all(params.max_tokens == 8 for params in sent))
