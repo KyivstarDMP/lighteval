@@ -304,9 +304,10 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
         'Answer'
     """
     result = text
+    closed_by_pair = []
 
     for start_tag, end_tag in tag_pairs:
-        closed = end_tag in result
+        closed_by_pair.append((start_tag, end_tag in result))
         while start_tag in result and end_tag in result:
             start = result.find(start_tag)
             end = result.find(end_tag, start)
@@ -314,6 +315,10 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
                 result = result[:start] + result[end + len(end_tag) :]
             else:
                 break
+
+    # Every pair's complete spans are gone first, so a pair that shares its start
+    # tag with another (gpt-oss's two final-channel closers) can still close it.
+    for start_tag, closed in closed_by_pair:
         # A span that opens and never closes (the budget ran out mid-thought) is
         # all reasoning: score it as an empty answer, as server-side parsers do.
         if start_tag and start_tag in result:

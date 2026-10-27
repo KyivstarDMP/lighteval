@@ -68,6 +68,15 @@ class TestRemoveReasoningTags(unittest.TestCase):
     def test_empty_start_tag_keeps_the_answer_after_its_closer(self):
         self.assertEqual(remove_reasoning_tags("Reasoning</think>Answer", [("", "</think>")]), "Answer")
 
+    def test_a_later_pair_with_the_same_start_tag_closes_the_span(self):
+        # gpt-oss: the full final-channel closer first, the shorter one as a fallback
+        pairs = [("<|channel|>analysis", "<|channel|>final<|message|>"), ("<|channel|>analysis", "<|channel|>final")]
+        self.assertEqual(
+            remove_reasoning_tags("<|channel|>analysisSix times seven.<|channel|>final#### 42", pairs), "#### 42"
+        )
+        self.assertEqual(remove_reasoning_tags("<|channel|>analysisX<|channel|>final<|message|>42", pairs), "42")
+        self.assertEqual(remove_reasoning_tags("<|channel|>analysisSix times seven, so", pairs), "")  # never closed
+
     def test_empty_start_tag_without_a_closer_is_all_reasoning(self):
         # the chat template opened the span in the prompt, and the output never closed it (budget exhausted)
         self.assertEqual(remove_reasoning_tags("No closing tag", [("", "</think>")]), "")
