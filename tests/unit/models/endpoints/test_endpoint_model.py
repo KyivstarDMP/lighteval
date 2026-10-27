@@ -24,6 +24,7 @@ import pytest
 import yaml
 
 from lighteval.models.endpoints.endpoint_model import InferenceEndpointModelConfig
+from lighteval.tasks.prompt_manager import ImagePlacement
 
 
 class TestInferenceEndpointModelConfig:
@@ -71,8 +72,12 @@ class TestInferenceEndpointModelConfig:
                         "truncate_prompt": None,
                         "response_format": None,
                         "reasoning_effort": None,
+                        "skip_special_tokens": None,
+                        "thinking_token_budget": None,
                     },
                     "cache_dir": "~/.cache/huggingface/lighteval",
+                    "chat_template_kwargs": {},
+                    "image_placement": ImagePlacement.inline,
                 },
             ),
         ],

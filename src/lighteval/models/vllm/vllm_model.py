@@ -30,7 +30,7 @@ import os
 from typing import ClassVar, Coroutine, Optional
 
 import torch
-from pydantic import NonNegativeFloat, NonNegativeInt, PositiveInt
+from pydantic import NonNegativeFloat, NonNegativeInt, PositiveInt, model_validator
 from tqdm import tqdm
 
 from lighteval.data import GenerativeTaskDataset, LoglikelihoodDataset
@@ -201,6 +201,11 @@ class VLLMModelConfig(ModelConfig):
         system_prompt (str | None, optional, defaults to None): Optional system prompt to be used with chat models.
             This prompt sets the behavior and context for the model during evaluation.
         cache_dir (str, optional, defaults to "~/.cache/huggingface/lighteval"): Directory to cache the model.
+        reasoning_config (dict[str, str] | None, optional, defaults to None):
+            What opens and closes the model's thought, as vLLM's `ReasoningConfig` takes them
+            (`reasoning_start_str`, `reasoning_end_str`). Needed for `generation_parameters.thinking_token_budget`:
+            vLLM counts a thought's tokens from the opener and, at the budget, forces the closer. The closer is also
+            how vLLM tells that a thought closed by itself, so give the bare closer.
 
     Example:
         ```python
@@ -248,6 +253,18 @@ class VLLMModelConfig(ModelConfig):
     skip_mm_profiling: bool = False
     attention_backend: str | None = None
     mm_encoder_attn_backend: str | None = None
+    reasoning_config: dict[str, str] | None = None  # vLLM's ReasoningConfig, for a thinking budget
+
+    @model_validator(mode="after")
+    def _budget_needs_a_reasoning_config(self) -> "VLLMModelConfig":
+        if self.generation_parameters.thinking_token_budget is not None and not self.reasoning_config:
+            raise ValueError(
+                "generation_parameters.thinking_token_budget needs reasoning_config: the strings that open and close "
+                "a thought (reasoning_start_str, reasoning_end_str)"
+            )
+        if self.reasoning_config and set(self.reasoning_config) != {"reasoning_start_str", "reasoning_end_str"}:
+            raise ValueError("reasoning_config takes reasoning_start_str and reasoning_end_str")
+        return self
 
 
 @requires("vllm")
@@ -349,6 +366,10 @@ class VLLMModel(LightevalModel):
             self.model_args["attention_backend"] = config.attention_backend
         if config.mm_encoder_attn_backend is not None:
             self.model_args["mm_encoder_attn_backend"] = config.mm_encoder_attn_backend
+        if config.reasoning_config is not None:  # the single engine and the data-parallel workers build from these
+            from vllm.config import ReasoningConfig
+
+            self.model_args["reasoning_config"] = ReasoningConfig(**config.reasoning_config)
 
         if config.data_parallel_size > 1:
             self.model_args["distributed_executor_backend"] = "ray"
@@ -373,6 +394,28 @@ class VLLMModel(LightevalModel):
             self._max_length = model.llm_engine.model_config.max_model_len
 
         return model
+
+    def _max_new_tokens(self, room: int | None) -> int | None:
+        """Return a split's token limit: the configured one, else the task's own room (``generation_size``).
+
+        With a thinking budget, the thought takes at most the budget and the answer keeps the task's room, so the limit
+        is the budget, the thought's opener and closer and the room, within the configured limit.
+        """
+        configured = self.config.generation_parameters.max_new_tokens
+        budget = self.config.generation_parameters.thinking_token_budget
+        if budget is None or room is None:
+            return configured or room
+        limit = budget + self._thought_marker_tokens() + room
+        return min(configured, limit) if configured else limit
+
+    def _thought_marker_tokens(self) -> int:
+        """Return the tokens of the thought's opener and closer, which a thinking budget doesn't count."""
+        strings = self.config.reasoning_config or {}
+        return sum(
+            len(self.tokenizer.encode(strings[key], add_special_tokens=False))
+            for key in ("reasoning_start_str", "reasoning_end_str")
+            if strings.get(key)
+        )
 
     def _create_auto_tokenizer(self, config: VLLMModelConfig):
         tokenizer = get_tokenizer(
@@ -433,7 +476,7 @@ class VLLMModel(LightevalModel):
                 # the case! Because of that we only use batch size of 1
                 stop_tokens = split[0].stop_sequences or []
 
-            max_new_tokens = self.config.generation_parameters.max_new_tokens or split[0].generation_size
+            max_new_tokens = self._max_new_tokens(split[0].generation_size)
             num_samples = split[0].num_samples
 
             # Build vLLM prompts per doc: docs carrying images become multimodal prompt
@@ -697,6 +740,8 @@ class AsyncVLLMModel(VLLMModel):
         Returns:
             AsyncLLM: The created async VLLM instance
         """
+        if config.reasoning_config is not None or config.generation_parameters.thinking_token_budget is not None:
+            raise ValueError("the async vLLM engine doesn't take a thinking budget; use the sync engine")
         self.model_args = {
             "model": config.model_name,
             "gpu_memory_utilization": config.gpu_memory_utilization,

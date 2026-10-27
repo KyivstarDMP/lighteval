@@ -184,14 +184,13 @@ class LiteLLMClient(LightevalModel):
 
         if self.generation_parameters.reasoning_effort is None:
             logger.warning(
-                f"Model {self.model} supports reasoning but no reasoning_effort is set. "
-                "Token budget will not be boosted for reasoning. If you want the model to reason, "
-                "set reasoning_effort explicitly (e.g., 'low', 'medium', 'high')."
+                f"Model {self.model} supports reasoning but no reasoning_effort is set: the provider's default "
+                "applies. Set reasoning_effort explicitly (e.g., 'low', 'medium', 'high') to choose it."
             )
-        elif self._should_boost_for_reasoning():
+        else:
             logger.warning(
-                "Reasoning model detected, increasing max_new_tokens tenfold (capped at the model's "
-                "max length) to allow for reasoning tokens."
+                "Reasoning model: its reasoning counts toward max_new_tokens, which is sent as configured; set it "
+                "to leave room for the reasoning."
             )
 
     def _prepare_stop_sequence(self, stop_sequence):
@@ -230,19 +229,11 @@ class LiteLLMClient(LightevalModel):
         base_model_name = model_name.split("/")[-1].lower()
         return base_model_name.startswith(("o1", "o3", "o4"))
 
-    def _should_boost_for_reasoning(self) -> bool:
-        reasoning_effort = self.generation_parameters.reasoning_effort
-        return isinstance(reasoning_effort, str) and reasoning_effort.strip().lower() != "none"
-
     def _prepare_max_new_tokens(self, max_new_tokens) -> int | None:
-        """Calculate completion tokens based on max_new_tokens."""
+        """Return the completion limit as configured (None when unset): a reasoning model's reasoning counts toward
+        it, so a run that wants room for reasoning sets it, rather than having it multiplied here."""
         if not max_new_tokens or max_new_tokens <= 0:
             return None
-
-        if supports_reasoning(self.model) and self._should_boost_for_reasoning():
-            # We need to allow more tokens to include reasoning tokens
-            max_new_tokens = min(max_new_tokens * 10, self.max_length)
-
         return max_new_tokens
 
     def _tenacity_wait(self, retry_state: RetryCallState) -> float:

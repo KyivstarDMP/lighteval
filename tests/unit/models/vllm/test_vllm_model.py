@@ -116,6 +116,7 @@ class TestVLLMMultimodalPayload(unittest.TestCase):
         model = self._bare_model()
         model.config = Mock()
         model.config.generation_parameters.max_new_tokens = 16
+        model.config.generation_parameters.thinking_token_budget = None
         model._max_length = None  # all-image split -> no tokenization/truncation
         model.prompt_manager.prepare_prompt_multimodal.return_value = "Question <start_of_image>"
 
@@ -263,3 +264,91 @@ class TestVLLMRequestSeeds(unittest.TestCase):
         sent = model.model.generate.call_args.kwargs["sampling_params"]
         self.assertEqual([params.seed for params in sent], vllm_model.request_seeds(7, [[1, 2], [3]]))
         self.assertTrue(all(params.max_tokens == 8 for params in sent))
+
+
+class TestVLLMThinkingBudget(unittest.TestCase):
+    """A thinking budget: vLLM's per-request budget, the engine's reasoning config, and a split's token limit."""
+
+    GEMMA = {"reasoning_start_str": "<|channel>", "reasoning_end_str": "<channel|>"}
+
+    def test_a_budget_needs_a_reasoning_config_of_two_strings(self):
+        from pydantic import ValidationError
+
+        from lighteval.models.model_input import GenerationParameters
+
+        budgeted = GenerationParameters(thinking_token_budget=512)
+        with self.assertRaises(ValidationError):
+            VLLMModelConfig(model_name="m", generation_parameters=budgeted)
+        with self.assertRaises(ValidationError):
+            VLLMModelConfig(model_name="m", reasoning_config={"reasoning_start_str": "<think>"})
+        config = VLLMModelConfig(model_name="m", generation_parameters=budgeted, reasoning_config=self.GEMMA)
+        self.assertEqual(config.reasoning_config, self.GEMMA)
+        self.assertIn("reasoning_config", config.model_dump())  # so in the response cache's key
+
+    def _model(self, **generation):
+        from lighteval.models.model_input import GenerationParameters
+
+        model = VLLMModel.__new__(VLLMModel)
+        model.config = VLLMModelConfig(
+            model_name="m",
+            generation_parameters=GenerationParameters(**generation),
+            reasoning_config=self.GEMMA if "thinking_token_budget" in generation else None,
+        )
+        model._tokenizer = Mock()
+        model._tokenizer.encode.side_effect = lambda text, add_special_tokens=False: [7] * len(text.split("|"))
+        return model
+
+    def test_a_splits_limit_is_the_budget_the_markers_and_the_tasks_room_within_the_configured_one(self):
+        # each marker encodes to two ids here ("<", "channel>" split at "|"): 4 marker tokens in all
+        self.assertEqual(self._model(max_new_tokens=10240)._max_new_tokens(1280), 10240)  # no budget
+        self.assertEqual(self._model()._max_new_tokens(1280), 1280)
+        self.assertEqual(self._model(max_new_tokens=10240, thinking_token_budget=2048)._max_new_tokens(1280), 3332)
+        self.assertEqual(self._model(max_new_tokens=3000, thinking_token_budget=2048)._max_new_tokens(1280), 3000)
+        self.assertEqual(self._model(thinking_token_budget=2048)._max_new_tokens(15), 2067)
+        self.assertEqual(self._model(max_new_tokens=10240, thinking_token_budget=2048)._max_new_tokens(None), 10240)
+
+    def test_greedy_until_asks_each_split_for_its_own_limit(self):
+        model = self._model(max_new_tokens=10240, thinking_token_budget=512)
+        model.DATASET_SPLITS = 1
+        model.use_chat_template = True
+        model._max_length = None
+        model.prompt_manager = Mock()
+        model.prompt_manager.prepare_prompt_multimodal.return_value = "Question <start_of_image>"
+        image = Image.new("RGB", (4, 4), (255, 0, 0))
+        asked = []
+
+        def fake_generate(inputs, max_new_tokens=None, **kwargs):
+            asked.append(max_new_tokens)
+            output = Mock()
+            output.outputs = [Mock(token_ids=[1], text="A")]
+            output.prompt_token_ids = [1]
+            return [output for _ in inputs]
+
+        model._generate = fake_generate
+        docs = [Doc(query="q", choices=[], gold_index=0, images=[image], generation_size=size) for size in (15, 1280)]
+        model._greedy_until(docs)
+        self.assertEqual(sorted(asked), [512 + 4 + 15, 512 + 4 + 1280])
+
+    def test_the_engine_gets_the_reasoning_config_and_the_async_engine_refuses_it(self):
+        from lighteval.models.model_input import GenerationParameters
+        from lighteval.models.vllm import vllm_model
+
+        class FakeReasoningConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        fake_config = ModuleType("vllm.config")
+        fake_config.ReasoningConfig = FakeReasoningConfig
+        config = VLLMModelConfig(
+            model_name="m",
+            data_parallel_size=2,  # the data-parallel path builds its workers from model_args and returns no engine
+            generation_parameters=GenerationParameters(thinking_token_budget=512),
+            reasoning_config=self.GEMMA,
+        )
+        model = VLLMModel.__new__(VLLMModel)
+        model._max_length = 4096
+        with patch.dict(sys.modules, {**TestVLLMPromptConstruction._fake_vllm_modules(), "vllm.config": fake_config}):
+            self.assertIsNone(model._create_auto_model(config))
+        self.assertEqual(model.model_args["reasoning_config"].kwargs, self.GEMMA)
+        with self.assertRaises(ValueError):
+            vllm_model.AsyncVLLMModel.__new__(vllm_model.AsyncVLLMModel)._create_auto_model(config)
