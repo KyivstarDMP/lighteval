@@ -24,6 +24,7 @@ import asyncio
 import copy
 import gc
 import hashlib
+import importlib.util
 import itertools
 import logging
 import os
@@ -135,6 +136,21 @@ else:
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 STARTING_BATCH_SIZE = 512
+
+
+def _budget_reads_unfilled_outputs() -> bool:
+    """Whether this vLLM's thinking budget reads a request's output before async scheduling fills in its newest token.
+
+    vLLM 0.19's budget is a logits processor whose state is updated before the previous step's sampled tokens are copied
+    into the request's output: the newest id is still a placeholder (-1), and the processor's scan, which only reads the
+    tokens added since its last one, never goes back to it. A thought the model closes within the last two tokens before
+    the budget is then missed, and a second closer is forced into the answer at the budget. vLLM 0.23 updates the
+    budget's state in the sampler, after the copy (``vllm.v1.sample.thinking_budget_state``), and needs nothing.
+    """
+    try:
+        return importlib.util.find_spec("vllm.v1.sample.thinking_budget_state") is None
+    except ModuleNotFoundError:  # another layout: turn async scheduling off, which is always correct
+        return True
 
 
 class VLLMModelConfig(ModelConfig):
@@ -370,6 +386,8 @@ class VLLMModel(LightevalModel):
             from vllm.config import ReasoningConfig
 
             self.model_args["reasoning_config"] = ReasoningConfig(**config.reasoning_config)
+            if _budget_reads_unfilled_outputs():
+                self.model_args["async_scheduling"] = False
 
         if config.data_parallel_size > 1:
             self.model_args["distributed_executor_backend"] = "ray"

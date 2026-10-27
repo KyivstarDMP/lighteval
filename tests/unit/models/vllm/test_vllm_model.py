@@ -352,3 +352,32 @@ class TestVLLMThinkingBudget(unittest.TestCase):
         self.assertEqual(model.model_args["reasoning_config"].kwargs, self.GEMMA)
         with self.assertRaises(ValueError):
             vllm_model.AsyncVLLMModel.__new__(vllm_model.AsyncVLLMModel)._create_auto_model(config)
+
+    def test_async_scheduling_is_off_where_the_budget_reads_unfilled_outputs(self):
+        # vLLM 0.19's budget misses a closer still a placeholder under async scheduling and forces a second one; 0.23's
+        # budget reads the output after the copy and keeps async scheduling
+        from lighteval.models.model_input import GenerationParameters
+        from lighteval.models.vllm import vllm_model
+
+        fake_config = ModuleType("vllm.config")
+        fake_config.ReasoningConfig = lambda **kwargs: kwargs
+        modules = {**TestVLLMPromptConstruction._fake_vllm_modules(), "vllm.config": fake_config}
+        budgeted = {
+            "generation_parameters": GenerationParameters(thinking_token_budget=512),
+            "reasoning_config": self.GEMMA,
+        }
+        for reads_unfilled, expected in ((True, False), (False, None)):
+            model = VLLMModel.__new__(VLLMModel)
+            model._max_length = 4096
+            config = VLLMModelConfig(model_name="m", data_parallel_size=2, **budgeted)
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(vllm_model, "_budget_reads_unfilled_outputs", return_value=reads_unfilled),
+            ):
+                model._create_auto_model(config)
+            self.assertEqual(model.model_args.get("async_scheduling"), expected)
+        model = VLLMModel.__new__(VLLMModel)
+        model._max_length = 4096
+        with patch.dict(sys.modules, modules):
+            model._create_auto_model(VLLMModelConfig(model_name="m", data_parallel_size=2))
+        self.assertNotIn("async_scheduling", model.model_args)  # no budget: vLLM's default
