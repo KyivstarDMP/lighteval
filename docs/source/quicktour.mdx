@@ -102,10 +102,14 @@ correspond to the fields of the model configurations.
 
 The model configurations can be found [here](./package_reference/models).
 
-All models allow you to post-process your reasoning model predictions
-to remove the thinking tokens from the trace used to compute the metrics,
-using `--remove-reasoning-tags` and `--reasoning-tags` to specify which
-reasoning tags to remove (defaults to `<think>` and `</think>`).
+All models allow you to post-process your reasoning model predictions to
+remove the thinking tokens from the trace used to compute the metrics, using
+`--remove-reasoning-tags` and `--reasoning-tags` to specify which reasoning
+tags to remove (defaults to `<think>` and `</think>`). A span that opens and
+never closes, as when the budget runs out mid-thought, counts as reasoning to
+the end of the output: it is cut, and any text before it is what gets scored.
+For a chat template that opens the span in the prompt, give an empty start tag
+(`[('', '</think>')]`): an output with no end tag is then all reasoning.
 
 Here's an example with `mistralai/Magistral-Small-2507` which outputs custom
 thinking tokens:

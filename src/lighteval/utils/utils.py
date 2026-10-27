@@ -304,7 +304,6 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
         'Answer'
     """
     result = text
-
     for start_tag, end_tag in tag_pairs:
         while start_tag in result and end_tag in result:
             start = result.find(start_tag)
@@ -314,4 +313,19 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
             else:
                 break
 
+    # Every pair's complete spans are gone first, so a pair that shares its start
+    # tag with another (gpt-oss's two final-channel closers) can still close it.
+    for start_tag, _ in tag_pairs:
+        # A span that opens and never closes (the budget ran out mid-thought) is
+        # reasoning to the end of the output: cut it, keeping any answer text
+        # before it. An output that starts in the span scores as an empty answer.
+        if start_tag and start_tag in result:
+            result = result[: result.find(start_tag)]
+    # An empty start tag means the chat template opens the span in the prompt
+    # (Qwen3.5): an output that reaches none of those pairs' closers never left
+    # it, so it is all reasoning. The closers are looked for in the original
+    # text, since another pair may already have removed the one it wrote.
+    empty_opener_closers = [end_tag for start_tag, end_tag in tag_pairs if not start_tag]
+    if empty_opener_closers and not any(end_tag in text for end_tag in empty_opener_closers):
+        result = ""
     return result

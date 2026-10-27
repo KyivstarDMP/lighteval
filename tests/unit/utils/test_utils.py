@@ -60,4 +60,33 @@ class TestRemoveReasoningTags(unittest.TestCase):
         text = "<think> Reasoning section. Answer section"
         tag_pairs = [("<think>", "</think>")]
         result = remove_reasoning_tags(text, tag_pairs)
-        self.assertEqual(result, "<think> Reasoning section. Answer section")
+        self.assertEqual(result, "")  # an unterminated thought (budget exhausted) is all reasoning
+
+    def test_unclosed_span_after_a_closed_one(self):
+        self.assertEqual(remove_reasoning_tags("<think>a</think>Answer<think>b", [("<think>", "</think>")]), "Answer")
+
+    def test_empty_start_tag_keeps_the_answer_after_its_closer(self):
+        self.assertEqual(remove_reasoning_tags("Reasoning</think>Answer", [("", "</think>")]), "Answer")
+
+    def test_a_later_pair_with_the_same_start_tag_closes_the_span(self):
+        # gpt-oss: the full final-channel closer first, the shorter one as a fallback
+        pairs = [("<|channel|>analysis", "<|channel|>final<|message|>"), ("<|channel|>analysis", "<|channel|>final")]
+        self.assertEqual(
+            remove_reasoning_tags("<|channel|>analysisSix times seven.<|channel|>final#### 42", pairs), "#### 42"
+        )
+        self.assertEqual(remove_reasoning_tags("<|channel|>analysisX<|channel|>final<|message|>42", pairs), "42")
+        self.assertEqual(remove_reasoning_tags("<|channel|>analysisSix times seven, so", pairs), "")  # never closed
+
+    def test_empty_start_tag_without_a_closer_is_all_reasoning(self):
+        # the chat template opened the span in the prompt, and the output never closed it (budget exhausted)
+        self.assertEqual(remove_reasoning_tags("No closing tag", [("", "</think>")]), "")
+
+    def test_an_empty_start_tag_keeps_the_answer_when_another_pair_took_its_closer(self):
+        pairs = [("<think>", "</think>"), ("", "</think>")]
+        self.assertEqual(remove_reasoning_tags("<think>x</think>42", pairs), "42")
+        self.assertEqual(remove_reasoning_tags("<think>x", pairs), "")  # opened and never closed
+
+    def test_several_empty_start_tags_need_only_one_closer(self):
+        pairs = [("", "</think>"), ("", "</reasoning>")]
+        self.assertEqual(remove_reasoning_tags("Reasoning</think>42", pairs), "42")
+        self.assertEqual(remove_reasoning_tags("still thinking", pairs), "")  # never left the span
