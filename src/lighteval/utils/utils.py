@@ -320,7 +320,8 @@ def remove_reasoning_tags(text: str, tag_pairs: list[tuple[str, str]]) -> str:
     # tag with another (gpt-oss's two final-channel closers) can still close it.
     for start_tag, closed in closed_by_pair:
         # A span that opens and never closes (the budget ran out mid-thought) is
-        # all reasoning: score it as an empty answer, as server-side parsers do.
+        # reasoning to the end of the output: cut it, keeping any answer text
+        # before it. An output that starts in the span scores as an empty answer.
         if start_tag and start_tag in result:
             result = result[: result.find(start_tag)]
         # An empty start tag means the chat template opens the span in the prompt
