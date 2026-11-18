@@ -285,6 +285,9 @@ class InspectAIModelConfig(BaseModel):
 class LightevalModel(ABC):
     DATASET_SPLITS = 4
     is_async = False
+    # Whether the model was asked to think, when the backend knows it; None otherwise.
+    # Read when reasoning tags are removed: it decides whether a span that never closes is reasoning.
+    thinking: bool | None = None
 
     """Abstract model class defining the API that every model to plug into lighteval must follow."""
 

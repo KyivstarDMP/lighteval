@@ -558,6 +558,12 @@ class VLLMOpenAIModelConfig(ModelConfig):
             ``output_tokens``, with the finish reason in ``finish_reasons``;
             default ``True``. Part of the sample cache key, so answers cached
             without ids are not replayed.
+        chat_template_kwargs (dict):
+            Forwarded to the server's chat template. A boolean
+            ``enable_thinking`` in it is also the thinking mode that reasoning-tag
+            removal reads: with ``True`` a reasoning span that never closes is
+            all reasoning, with ``False`` it is part of the answer
+            (``remove_reasoning_tags``).
         server_fingerprint (str | None):
             Opaque identity of the engine behind ``base_url`` (an image digest,
             say), when the caller knows it. Never sent to the server; part of
@@ -654,6 +660,10 @@ class VLLMOpenAIClient(LightevalModel):
             chat_template_kwargs=config.chat_template_kwargs,
             image_placement=config.image_placement,
         )
+        # The thinking mode reasoning-tag removal reads, from the template switch the server renders with
+        # (Qwen's and Gemma's `enable_thinking`); None when the config doesn't set it.
+        enable_thinking = config.chat_template_kwargs.get("enable_thinking")
+        self.thinking = enable_thinking if isinstance(enable_thinking, bool) else None
 
         self._cache = SampleCache(config)
 

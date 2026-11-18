@@ -102,10 +102,26 @@ correspond to the fields of the model configurations.
 
 The model configurations can be found [here](./package_reference/models).
 
-All models allow you to post-process your reasoning model predictions
-to remove the thinking tokens from the trace used to compute the metrics,
-using `--remove-reasoning-tags` and `--reasoning-tags` to specify which
-reasoning tags to remove (defaults to `<think>` and `</think>`).
+All models allow you to post-process your reasoning model predictions to
+remove the thinking tokens from the trace used to compute the metrics, using
+`--remove-reasoning-tags` and `--reasoning-tags` to specify which reasoning
+tags to remove (defaults to `<think>` and `</think>`). Unless the model was
+asked not to think (see below), a span that opens and never closes, as when the
+budget runs out mid-thought, counts as reasoning to the end of the output: it
+is cut, and any text before it is what gets scored.
+For a chat template that opens the span in the prompt, give an empty start tag
+(`[('', '</think>')]`).
+
+How an unclosed span is read depends on whether the model was asked to think,
+which only the `vllm-openai` backend knows (from `enable_thinking` in
+`chat_template_kwargs`). With `enable_thinking: true`, an output with no end
+tag after an empty start tag is all reasoning, so the answer scored is empty.
+With `enable_thinking: false`, an unclosed span is kept as part of the answer.
+Where the mode is not known (other backends, or no `enable_thinking`), a span
+with a start tag is cut and an output with no end tag after an empty start tag
+is kept. Don't pass an empty start tag for a server that already separates the
+reasoning (a vLLM `--reasoning-parser`): the answer it returns has no end tag,
+so in thinking mode it would be emptied.
 
 Here's an example with `mistralai/Magistral-Small-2507` which outputs custom
 thinking tokens:

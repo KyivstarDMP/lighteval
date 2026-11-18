@@ -57,6 +57,15 @@ Unlike generic OpenAI clients, vLLM-only sampling parameters
 `chat_template_kwargs` reaches the server's template rendering (e.g. Qwen's
 `enable_thinking` switch).
 
+A boolean `enable_thinking` there is also the thinking mode that
+`--remove-reasoning-tags` reads. With `true`, a reasoning span that never
+closes (the budget ran out mid-thought) is all reasoning, and with an empty
+start tag (`[('', '</think>')]`, for a template that opens the span in the
+prompt) an output without the end tag scores as an empty answer. With `false`,
+an unclosed span is part of the answer. When the server runs a
+`--reasoning-parser`, the answer it returns holds no reasoning tags: pass no
+empty start tag then, or that answer would be emptied.
+
 Generations are streamed, so `timeout` is never the length of a generation —
 a 32k-token answer needs no special timeout. A request that has started stalls
 when its own chunks stop for `timeout`; a request still queued behind others

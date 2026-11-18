@@ -56,6 +56,7 @@ from lighteval.models.endpoints.vllm_openai_model import (
 )
 from lighteval.models.model_input import GenerationParameters
 from lighteval.models.model_output import ModelResponse, RequestFailure
+from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
 from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
 from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc
@@ -1570,6 +1571,68 @@ class TestDocOwnTurns:
             FINAL_TURN,
             {"role": "assistant", "content": " Paris"},
         ]
+
+
+# ---------------------------------------------------------------------------
+# 4c. The thinking mode reasoning-tag removal reads
+# ---------------------------------------------------------------------------
+
+
+class TestThinkingMode:
+    @pytest.mark.parametrize(
+        "chat_template_kwargs, expected",
+        [
+            ("chat_template_kwargs={enable_thinking:true}", True),
+            ("chat_template_kwargs={enable_thinking:false}", False),
+            ("chat_template_kwargs={reasoning_effort:high}", None),
+            ("", None),
+        ],
+    )
+    def test_the_mode_is_the_templates_enable_thinking(self, tmp_path, chat_template_kwargs, expected):
+        args = ",".join(part for part in (chat_template_kwargs, f"cache_dir={tmp_path}") if part)
+        config = VLLMOpenAIModelConfig.from_args(f"model_name=org/model-it,base_url=http://x/v1,{args}")
+        assert VLLMOpenAIClient(config).thinking is expected
+
+    @pytest.mark.parametrize(
+        "enable_thinking, tags, expected",
+        [
+            # Thinking on: an output that never closes the span the template opened is all reasoning.
+            ("true", "[('', '</think>')]", ""),
+            # Thinking off: an unclosed span is the answer.
+            ("false", "[('', '</think>')]", "Six times seven, so 42"),
+            ("false", "[('<think>', '</think>')]", "<think>Six times seven, so 42"),
+            ("true", "[('<think>', '</think>')]", ""),
+        ],
+    )
+    def test_the_pipeline_removes_tags_by_the_clients_mode(self, tmp_path, enable_thinking, tags, expected):
+        config = VLLMOpenAIModelConfig.from_args(
+            f"model_name=org/model-it,base_url=http://x/v1,cache_dir={tmp_path},"
+            f"chat_template_kwargs={{enable_thinking:{enable_thinking}}}"
+        )
+        pipeline = object.__new__(Pipeline)
+        pipeline.model = VLLMOpenAIClient(config)
+        pipeline.pipeline_parameters = PipelineParameters(launcher_type=ParallelismManager.NONE, reasoning_tags=tags)
+        text = "Six times seven, so 42" if "''" in tags else "<think>Six times seven, so 42"
+        response = ModelResponse(text=[text])
+
+        pipeline._post_process_outputs({"generative": [response]})
+
+        assert response.text_post_processed == [expected]
+
+    def test_an_answer_the_server_split_keeps_its_text_with_the_default_tags(self, tmp_path):
+        # A server reasoning parser returns only the answer; the client passes no tags of its own.
+        config = VLLMOpenAIModelConfig.from_args(
+            f"model_name=org/model-it,base_url=http://x/v1,cache_dir={tmp_path},"
+            "chat_template_kwargs={enable_thinking:true}"
+        )
+        pipeline = object.__new__(Pipeline)
+        pipeline.model = VLLMOpenAIClient(config)
+        pipeline.pipeline_parameters = PipelineParameters(launcher_type=ParallelismManager.NONE)
+        response = ModelResponse(text=["#### 42"])
+
+        pipeline._post_process_outputs({"generative": [response]})
+
+        assert response.text_post_processed == ["#### 42"]
 
 
 # ---------------------------------------------------------------------------
