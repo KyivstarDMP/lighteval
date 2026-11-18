@@ -1636,6 +1636,220 @@ class TestThinkingMode:
 
 
 # ---------------------------------------------------------------------------
+# 4d. Thinking budget
+# ---------------------------------------------------------------------------
+
+THOUGHT_MARKERS = {"reasoning_start_str": "<|channel>", "reasoning_end_str": "<channel|>"}
+
+
+class MarkerTokenizer:
+    """One id per marker string, one per character otherwise."""
+
+    def encode(self, text, add_special_tokens=False):
+        return [1] if text in THOUGHT_MARKERS.values() else [ord(c) for c in text]
+
+
+def _budget_client(budget=None, max_new_tokens=None, use_chat_template=True, reasoning_config=THOUGHT_MARKERS):
+    client = make_client(
+        use_chat_template=use_chat_template,
+        generation_parameters=GenerationParameters(max_new_tokens=max_new_tokens, thinking_token_budget=budget),
+    )
+    client.reasoning_config = reasoning_config if budget is not None else None
+    client._tokenizer = MarkerTokenizer()
+    client._budget_server_checked = True  # the version check has its own tests
+    return client
+
+
+def _sent_generation(client, generation_size):
+    """Run one doc through greedy_until against a stand-in server; return the keyword arguments of the request."""
+    doc = Doc(query="Q?", choices=[], gold_index=0, task_name="t", generation_size=generation_size)
+    doc.id = "0"
+    sdk = _generation_sdk()
+    with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+        client.greedy_until([doc])
+    create = sdk.chat.completions.create if client.prompt_manager.use_chat_template else sdk.completions.create
+    return create.call_args.kwargs
+
+
+class TestThinkingBudget:
+    def test_the_budget_is_sent_only_when_set(self):
+        assert _budget_client(budget=256)._sampling_params()[1] == {"thinking_token_budget": 256}
+        assert "thinking_token_budget" not in _budget_client()._sampling_params()[1]
+        assert _budget_client(budget=0)._sampling_params()[1] == {"thinking_token_budget": 0}
+
+    @pytest.mark.parametrize("use_chat_template", [True, False])
+    def test_the_budget_reaches_the_request_and_raises_the_limit(self, use_chat_template):
+        client = _budget_client(budget=256, max_new_tokens=10_000, use_chat_template=use_chat_template)
+        kwargs = _sent_generation(client, generation_size=100)
+        assert kwargs["extra_body"]["thinking_token_budget"] == 256
+        assert kwargs["max_tokens"] == 256 + 2 + 100  # the budget, the opener and closer, the task's room
+
+    @pytest.mark.parametrize(
+        "budget, max_new_tokens, room, expected",
+        [
+            (256, None, 100, 358),  # no configured limit: budget + markers + room
+            (256, 300, 100, 300),  # the configured limit caps it
+            (256, 10_000, None, 10_000),  # a task without a room keeps the configured limit
+            (256, 10_000, -1, 10_000),
+            (None, 10_000, 100, 10_000),  # no budget: as before
+            (None, None, 100, 100),
+            (None, None, None, None),
+        ],
+    )
+    def test_the_limit_rule(self, budget, max_new_tokens, room, expected):
+        assert _budget_client(budget=budget, max_new_tokens=max_new_tokens)._max_new_tokens(room) == expected
+
+    def test_nothing_changes_without_a_budget(self):
+        client = _budget_client(max_new_tokens=None)
+        client._budget_server_checked = False
+        with patch("httpx.get") as get:
+            kwargs = _sent_generation(client, generation_size=100)
+        assert kwargs["max_tokens"] == 100
+        assert "thinking_token_budget" not in (kwargs["extra_body"] or {})
+        get.assert_not_called()  # no version check either
+
+    def test_the_markers_are_counted_once_with_the_model_tokenizer(self):
+        client = _budget_client(budget=256)
+        client.reasoning_config = {"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"}
+        assert client._thought_marker_tokens() == len("<think>") + len("</think>")
+        client.reasoning_config = THOUGHT_MARKERS
+        assert client._thought_marker_tokens() == 15  # counted once per client
+
+    def test_without_client_tokenization_the_markers_use_the_pinned_tokenizer(self):
+        loads = []
+
+        def fake_from_pretrained(name, **kwargs):
+            loads.append((name, kwargs["revision"]))
+            return MarkerTokenizer()
+
+        config = VLLMOpenAIModelConfig(
+            model_name="org/model-it",
+            base_url="http://x/v1",
+            revision="0123456789abcdef0123456789abcdef01234567",
+            client_tokenization=False,
+            reasoning_config=THOUGHT_MARKERS,
+            generation_parameters={"thinking_token_budget": 256},
+            cache_dir=tempfile.mkdtemp(),
+        )
+        client = VLLMOpenAIClient(config)
+        with patch("transformers.AutoTokenizer.from_pretrained", side_effect=fake_from_pretrained):
+            assert client._max_new_tokens(100) == 358
+        assert loads == [("org/model-it", "0123456789abcdef0123456789abcdef01234567")]
+        assert client.tokenizer is None  # client tokenization stays off
+
+    def test_a_budget_needs_a_reasoning_config(self):
+        with pytest.raises(ValueError, match="needs reasoning_config"):
+            VLLMOpenAIModelConfig(
+                model_name="org/m", base_url="http://x/v1", generation_parameters={"thinking_token_budget": 256}
+            )
+        with pytest.raises(ValueError, match="takes reasoning_start_str and reasoning_end_str"):
+            VLLMOpenAIModelConfig(
+                model_name="org/m", base_url="http://x/v1", reasoning_config={"reasoning_start_str": "<think>"}
+            )
+
+    def test_inline_args_carry_the_budget_and_the_reasoning_config(self):
+        config = VLLMOpenAIModelConfig.from_args(
+            "model_name=org/m,base_url=http://x/v1,"
+            'reasoning_config={reasoning_start_str:"<|channel>",reasoning_end_str:"<channel|>"},'
+            "generation_parameters={thinking_token_budget:256}"
+        )
+        assert config.reasoning_config == THOUGHT_MARKERS
+        assert config.generation_parameters.thinking_token_budget == 256
+
+    def test_the_budget_and_the_reasoning_config_are_part_of_the_cache_key(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            plain = VLLMOpenAIModelConfig(model_name="org/m", base_url="http://x/v1", cache_dir=temp_dir)
+            budgeted = VLLMOpenAIModelConfig(
+                model_name="org/m",
+                base_url="http://x/v1",
+                cache_dir=temp_dir,
+                reasoning_config=THOUGHT_MARKERS,
+                generation_parameters={"thinking_token_budget": 256},
+            )
+            assert SampleCache(plain).get_model_hash(plain) != SampleCache(budgeted).get_model_hash(budgeted)
+
+
+def _version_response(version):
+    request = httpx.Request("GET", "http://localhost:8000/version")
+    return httpx.Response(200, json={"version": version}, request=request)
+
+
+class TestBudgetServerCheck:
+    """vLLM ignores a request field it doesn't know, so a budget goes only to a server that takes it."""
+
+    @pytest.mark.parametrize(
+        "use_chat_template, version, takes_it",
+        [
+            (True, "0.23.0", True),
+            (True, "0.28.0", True),
+            (True, "0.19.0", True),
+            (True, "0.18.1", False),
+            (False, "0.22.0", True),
+            (False, "0.21.0", False),
+            (True, "0.24.1.dev5+gabc1234", True),
+            (True, "unknown", False),
+        ],
+    )
+    def test_the_servers_version_must_take_the_budget(self, use_chat_template, version, takes_it):
+        client = _budget_client(budget=256, use_chat_template=use_chat_template)
+        client._budget_server_checked = False
+        with patch("httpx.get", return_value=_version_response(version)) as get:
+            if takes_it:
+                client._check_budget_server()
+                client._check_budget_server()
+                assert get.call_count == 1  # read once
+            else:
+                with pytest.raises(RuntimeError, match="ignores it"):
+                    client._check_budget_server()
+        assert get.call_args.args[0] == "http://localhost:8000/version"
+
+    def test_a_version_that_cannot_be_read_is_refused(self):
+        client = _budget_client(budget=256)
+        client._budget_server_checked = False
+        with patch("httpx.get", side_effect=httpx.ConnectError("refused")):
+            with pytest.raises(RuntimeError, match="could not be read"):
+                client._check_budget_server()
+
+    def test_generation_checks_the_server_before_sending(self):
+        client = _budget_client(budget=256)
+        client._budget_server_checked = False
+        sdk = _generation_sdk()
+        doc = Doc(query="Q?", choices=[], gold_index=0, task_name="t", generation_size=8)
+        doc.id = "0"
+        with patch("httpx.get", return_value=_version_response("0.18.1")):
+            with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+                with pytest.raises(RuntimeError, match="vLLM 0.18.1"):
+                    client.greedy_until([doc])
+        sdk.chat.completions.create.assert_not_called()
+
+    def test_a_refused_budget_inside_a_stream_aborts_the_run(self):
+        # vLLM's refusal when it runs without a reasoning config, reported inside the stream
+        refusal = _stream_error(
+            "thinking_token_budget is set but reasoning_config is not configured. Please set --reasoning-parser "
+            "and/or --reasoning-config to use thinking_token_budget."
+        )
+        call = AsyncMock(side_effect=refusal)
+        with pytest.raises(RuntimeError, match="refused the thinking budget"):
+            run(_budget_client(budget=256)._request(call, label="test"))
+        assert call.await_count == 1  # not retried
+
+    def test_a_refused_budget_as_a_bad_request_aborts_the_run(self):
+        request = httpx.Request("POST", "http://localhost:8000/v1/chat/completions")
+        refusal = openai.APIStatusError(
+            "thinking_token_budget is not yet supported by the V2 model runner.",
+            response=httpx.Response(400, request=request),
+            body=None,
+        )
+        with pytest.raises(RuntimeError, match="VLLM_USE_V2_MODEL_RUNNER=0"):
+            run(_budget_client(budget=256)._request(AsyncMock(side_effect=refusal), label="test"))
+
+    def test_without_a_budget_a_stream_error_keeps_its_retries(self):
+        call = AsyncMock(side_effect=_stream_error("thinking_token_budget is set but reasoning_config is not set"))
+        result = run(_budget_client()._request(call, label="test"))
+        assert result.reason == RequestFailure.RETRIES_EXHAUSTED
+
+
+# ---------------------------------------------------------------------------
 # 5. Chat-route LL scoring
 # ---------------------------------------------------------------------------
 

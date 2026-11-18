@@ -24,6 +24,7 @@
 import pytest
 
 from lighteval.models.endpoints.tgi_model import TGIModelConfig
+from lighteval.tasks.prompt_manager import ImagePlacement
 
 
 class TestTGIModelConfig:
@@ -59,8 +60,12 @@ class TestTGIModelConfig:
                         "truncate_prompt": None,
                         "response_format": None,
                         "reasoning_effort": None,
+                        "skip_special_tokens": None,
+                        "thinking_token_budget": None,
                     },
                     "cache_dir": "~/.cache/huggingface/lighteval",
+                    "chat_template_kwargs": {},
+                    "image_placement": ImagePlacement.inline,
                 },
             ),
         ],

@@ -56,6 +56,7 @@ from typing import ClassVar, NamedTuple
 import httpx
 import openai
 from openai import NOT_GIVEN, AsyncOpenAI
+from pydantic import model_validator
 from tqdm import tqdm
 
 from lighteval.data import GenerativeTaskDataset, LoglikelihoodDataset
@@ -82,6 +83,10 @@ _STALL_ABORT_AFTER = 8
 _DEFAULT_MAX_LENGTH = 4096
 _DEFAULT_STALL_S = 600.0  # the stall bound when the config leaves `timeout` unset
 _KEEPALIVE_EXPIRY_S = 2.0  # below vLLM's HTTP keep-alive (5 s): never reuse a connection the server closed
+# The first vLLM releases whose OpenAI requests take `thinking_token_budget`, by route. vLLM ignores a request field it
+# doesn't know (it logs it at debug level), so an older server would drop the budget without a word.
+_BUDGET_SINCE = {"chat": (0, 19, 0), "text": (0, 22, 0)}
+_VERSION_PREFIX = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
 
 # Adaptive concurrency: how the in-flight limit follows the server's load.
 _LOAD_INTERVAL_S = 2.0
@@ -212,6 +217,19 @@ _SERIES_LINE = re.compile(r"^(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)(?:\{[^}]*\})?\s+
 
 def _metrics_url(base_url: str) -> str:
     return base_url.rstrip("/").removesuffix("/v1") + "/metrics"
+
+
+def _version_url(base_url: str) -> str:
+    return base_url.rstrip("/").removesuffix("/v1") + "/version"
+
+
+def _budget_refused(error: BaseException) -> bool:
+    """Whether the server refused a request's thinking budget, which it then refuses for every request.
+
+    vLLM refuses it when it runs without a reasoning config (no ``--reasoning-parser`` or ``--reasoning-config``)
+    and, on 0.23, under the V2 model runner; a streamed request gets the refusal inside the stream.
+    """
+    return "thinking_token_budget" in str(error)
 
 
 def _parse_server_load(text: str) -> _ServerLoad | None:
@@ -564,6 +582,21 @@ class VLLMOpenAIModelConfig(ModelConfig):
             removal reads: with ``True`` a reasoning span that never closes is
             all reasoning, with ``False`` it is part of the answer
             (``remove_reasoning_tags``).
+        reasoning_config (dict[str, str] | None):
+            What opens and closes the model's thought, as vLLM's
+            ``ReasoningConfig`` takes them (``reasoning_start_str``,
+            ``reasoning_end_str``; give the bare closer). Needed for
+            ``generation_parameters.thinking_token_budget``, which is sent as
+            the request's ``thinking_token_budget``: the server forces the
+            closer once a thought has taken the budget. The server applies it
+            only with a reasoning config of its own (``--reasoning-parser`` or
+            ``--reasoning-config`` with the same strings); here the strings
+            only size the generation limit. With a budget, a split's limit is
+            the budget, the opener's and closer's tokens and the task's own
+            room (``generation_size``), within ``max_new_tokens``: the thought
+            gets the budget and the answer its room. In inline model args,
+            quote the strings:
+            ``reasoning_config={reasoning_start_str:"<think>",reasoning_end_str:"</think>"}``.
         server_fingerprint (str | None):
             Opaque identity of the engine behind ``base_url`` (an image digest,
             say), when the caller knows it. Never sent to the server; part of
@@ -599,6 +632,18 @@ class VLLMOpenAIModelConfig(ModelConfig):
     pairwise_tokenization: bool = False
     return_token_ids: bool = True
     server_fingerprint: str | None = None
+    reasoning_config: dict[str, str] | None = None  # what opens and closes a thought, for a thinking budget
+
+    @model_validator(mode="after")
+    def _budget_needs_a_reasoning_config(self) -> "VLLMOpenAIModelConfig":
+        if self.generation_parameters.thinking_token_budget is not None and not self.reasoning_config:
+            raise ValueError(
+                "generation_parameters.thinking_token_budget needs reasoning_config: the strings that open and close "
+                "a thought (reasoning_start_str, reasoning_end_str)"
+            )
+        if self.reasoning_config and set(self.reasoning_config) != {"reasoning_start_str", "reasoning_end_str"}:
+            raise ValueError("reasoning_config takes reasoning_start_str and reasoning_end_str")
+        return self
 
     CACHE_KEY_EXCLUDE: ClassVar[frozenset[str]] = frozenset(
         {
@@ -629,6 +674,9 @@ class VLLMOpenAIClient(LightevalModel):
     _context_budget: int | None = None
     _add_special_tokens: bool | None = None
     return_token_ids = True
+    reasoning_config: dict[str, str] | None = None
+    _marker_tokens: int | None = None  # the thought's opener and closer, counted once
+    _budget_server_checked = False
 
     def __init__(self, config: VLLMOpenAIModelConfig) -> None:
         self.config = config
@@ -648,6 +696,7 @@ class VLLMOpenAIClient(LightevalModel):
         self._trust_remote_code = config.trust_remote_code
         self._add_special_tokens = config.add_special_tokens
         self.return_token_ids = config.return_token_ids
+        self.reasoning_config = config.reasoning_config
 
         self.API_MAX_RETRY = config.api_max_retry
         self.API_RETRY_SLEEP = config.api_retry_sleep
@@ -760,6 +809,8 @@ class VLLMOpenAIClient(LightevalModel):
         - Other 4xx (bad request, e.g. context overflow), and a prompt over the
           context budget: no retry, degrade to a ``_Failed`` so one oversized
           doc doesn't abort a long run.
+        - A refused thinking budget, in a stream or as a 4xx: **raise** — the
+          server refuses it for every request.
         """
         connect_failures = 0
         last_error = None
@@ -791,6 +842,7 @@ class VLLMOpenAIClient(LightevalModel):
                 logger.warning(f"Connection failure on {label}: {e} — retrying in {_CONNECT_RETRY_SLEEP_S}s")
                 await asyncio.sleep(_CONNECT_RETRY_SLEEP_S)
             except openai.APIStatusError as e:
+                self._raise_if_budget_refused(e)
                 last_error = e
                 if e.status_code == 429 or e.status_code >= 500:
                     wait_time = self._backoff(attempt)
@@ -800,6 +852,7 @@ class VLLMOpenAIClient(LightevalModel):
                     logger.error(f"HTTP {e.status_code} on {label}: {e}. Not retrying; degrading this request.")
                     return _Failed(RequestFailure.REJECTED, _describe(e))
             except openai.APIError as e:
+                self._raise_if_budget_refused(e)
                 last_error = e
                 wait_time = self._backoff(attempt)
                 logger.warning(f"Server error in the {label} stream: {e} — retrying in {wait_time:.1f}s")
@@ -807,6 +860,15 @@ class VLLMOpenAIClient(LightevalModel):
 
         logger.error(f"{label} failed after {self.API_MAX_RETRY} attempts; degrading this request.")
         return _Failed(RequestFailure.RETRIES_EXHAUSTED, _describe(last_error))
+
+    def _raise_if_budget_refused(self, error: openai.APIError) -> None:
+        """Abort the run when the server refuses the thinking budget: every request would be refused the same way."""
+        if self.generation_parameters.thinking_token_budget is not None and _budget_refused(error):
+            raise RuntimeError(
+                f"vLLM server at {self.base_url} refused the thinking budget ({error}); aborting the evaluation. "
+                "The server needs a reasoning config (--reasoning-parser or --reasoning-config) and, on vLLM 0.23, "
+                "VLLM_USE_V2_MODEL_RUNNER=0."
+            ) from error
 
     def _backoff(self, attempt: int) -> float:
         return min(64.0, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt))
@@ -841,6 +903,7 @@ class VLLMOpenAIClient(LightevalModel):
             "repetition_penalty": gp.repetition_penalty,
             "skip_special_tokens": gp.skip_special_tokens,
             "min_tokens": gp.min_new_tokens,
+            "thinking_token_budget": gp.thinking_token_budget,
         }
         return (
             {k: v for k, v in standard.items() if v is not None},
@@ -862,6 +925,70 @@ class VLLMOpenAIClient(LightevalModel):
     # ------------------------------------------------------------------
     # Generative routes
     # ------------------------------------------------------------------
+
+    def _max_new_tokens(self, room: int | None) -> int | None:
+        """Return a split's token limit: the configured one, else the task's own room (``generation_size``).
+
+        With a thinking budget, the thought takes at most the budget and the answer keeps the task's room, so the limit
+        is the budget, the thought's opener and closer and the room, within the configured limit. A task without a room
+        (``generation_size`` unset or -1) keeps the configured limit.
+        """
+        configured = self.generation_parameters.max_new_tokens
+        budget = self.generation_parameters.thinking_token_budget
+        if budget is None or room is None or room <= 0:
+            return configured or room
+        limit = budget + self._thought_marker_tokens() + room
+        return min(configured, limit) if configured else limit
+
+    def _thought_marker_tokens(self) -> int:
+        """Return the tokens of the thought's opener and closer, which a thinking budget doesn't count."""
+        if self._marker_tokens is None:
+            tokenizer = self.tokenizer
+            if tokenizer is None:  # client tokenization is off: load the same tokenizer for the count alone
+                from transformers import AutoTokenizer
+
+                tokenizer = AutoTokenizer.from_pretrained(
+                    self._tokenizer_id or self.model,
+                    revision=self._revision,
+                    trust_remote_code=self._trust_remote_code,
+                )
+            strings = self.reasoning_config or {}
+            self._marker_tokens = sum(
+                len(tokenizer.encode(strings[key], add_special_tokens=False))
+                for key in ("reasoning_start_str", "reasoning_end_str")
+                if strings.get(key)
+            )
+        return self._marker_tokens
+
+    def _check_budget_server(self) -> None:
+        """Refuse to send a thinking budget to a server that would drop it.
+
+        vLLM ignores a request field it doesn't know, logging it at debug level only, so a server older than the first
+        release that takes ``thinking_token_budget`` on this route would run without the budget and say nothing. The
+        server's version is read once from its ``/version``; a version that can't be read is refused too.
+        """
+        if self.generation_parameters.thinking_token_budget is None or self._budget_server_checked:
+            return
+        route = "chat" if self.prompt_manager.use_chat_template else "text"
+        url = _version_url(self.base_url)
+        try:
+            headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+            response = httpx.get(url, headers=headers, timeout=10.0)
+            response.raise_for_status()
+            version = str(response.json()["version"])
+        except Exception as e:  # noqa: BLE001 — any failure leaves the version unknown
+            raise RuntimeError(
+                f"generation_parameters.thinking_token_budget is set, but the server's vLLM version could not be read "
+                f"from {url} ({e}). A server that doesn't know the field ignores it, so the budget is not sent blind."
+            ) from e
+        match = _VERSION_PREFIX.match(version)
+        since = _BUDGET_SINCE[route]
+        if match is None or tuple(int(part) for part in match.groups()) < since:
+            raise RuntimeError(
+                f"generation_parameters.thinking_token_budget is set, but the server runs vLLM {version}, which ignores "
+                f"it on the {route} route; it is taken from vLLM {'.'.join(map(str, since))} on."
+            )
+        self._budget_server_checked = True
 
     def _prompt_room(self, reserve: int | None) -> int | None:
         """Prompt tokens the context budget leaves after ``reserve``; None when there is nothing to hold."""
@@ -943,6 +1070,7 @@ class VLLMOpenAIClient(LightevalModel):
     @cached(SamplingMethod.GENERATIVE)
     def greedy_until(self, docs: list[Doc]) -> list[ModelResponse]:
         """Generates responses using a greedy decoding strategy until certain ending conditions are met."""
+        self._check_budget_server()
         dataset = GenerativeTaskDataset(requests=docs, num_dataset_splits=self.DATASET_SPLITS)
 
         async def process_splits() -> list[ModelResponse]:
@@ -958,7 +1086,7 @@ class VLLMOpenAIClient(LightevalModel):
                     use_chat_template = self.prompt_manager.use_chat_template
                     if not use_chat_template and any(doc.images for doc in split):
                         raise ValueError("Multimodal prompts are only supported with chat template format.")
-                    max_new_tokens = self.generation_parameters.max_new_tokens or split[0].generation_size
+                    max_new_tokens = self._max_new_tokens(split[0].generation_size)
                     num_samples = split[0].num_samples
                     stop_sequence = split[0].stop_sequences
 
