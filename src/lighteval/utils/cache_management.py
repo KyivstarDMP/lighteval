@@ -61,6 +61,20 @@ class TaskID:
         return int.from_bytes(hashlib.sha256(str(self).encode()).digest(), byteorder="big")
 
 
+# Config fields added after sample caches were in use, as paths into the config's dump. While unset they stay out of
+# the model hash, so a cache built before they existed keeps its key; a set value enters the hash like any other field.
+_FIELDS_ADDED_LATER = (("generation_parameters", "thinking_token_budget"), ("reasoning_config",))
+
+
+def _drop_unset_later_fields(config_dict: dict) -> None:
+    for *parents, leaf in _FIELDS_ADDED_LATER:
+        node = config_dict
+        for key in parents:
+            node = node.get(key) if isinstance(node, dict) else None
+        if isinstance(node, dict) and leaf in node and node[leaf] is None:
+            del node[leaf]
+
+
 class SampleCache:
     """Disk-based cache for sample evaluation results using HuggingFace datasets.
     The model hash is a hash of the model config, to make sure we rerun the eval if any parameter changes
@@ -146,6 +160,7 @@ class SampleCache:
         """
         # Use Pydantic's model_dump instead of asdict for BaseModel
         config_dict = model_config.model_dump(exclude=set(model_config.CACHE_KEY_EXCLUDE))
+        _drop_unset_later_fields(config_dict)
         config_str = json.dumps(config_dict, sort_keys=True, default=str)
         return hashlib.sha256(config_str.encode()).hexdigest()[:16]
 
