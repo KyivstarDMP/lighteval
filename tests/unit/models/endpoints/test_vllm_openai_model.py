@@ -29,6 +29,7 @@ docs), config parsing and the cache-key exclusion of operational fields.
 """
 
 import asyncio
+import json
 import resource
 import tempfile
 from types import SimpleNamespace
@@ -55,6 +56,7 @@ from lighteval.models.endpoints.vllm_openai_model import (
 )
 from lighteval.models.model_input import GenerationParameters
 from lighteval.models.model_output import ModelResponse, RequestFailure
+from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
 from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc
 from lighteval.utils.cache_management import SampleCache
@@ -1427,6 +1429,147 @@ class TestBuildLlContextMessages:
         assert messages[0]["role"] == "system"
         assert messages[0]["content"] == [{"type": "text", "text": "Be terse."}]
         assert messages[-1]["role"] == "user"
+
+
+# ---------------------------------------------------------------------------
+# 4b. A doc's own few-shot samples: a conversation's earlier turns
+# ---------------------------------------------------------------------------
+
+EARLIER_TURNS = [
+    {"role": "user", "content": "Name a country."},
+    {"role": "assistant", "content": "France."},
+]
+FINAL_TURN = {"role": "user", "content": "And the capital?"}
+
+
+def make_conversation_doc(choices=("",), images=None):
+    """A doc whose prompt function carried a conversation's earlier turns as its own few-shot samples."""
+    history = [Doc(query="Name a country.", choices=["France."], gold_index=0, task_name="t")]
+    doc = Doc(
+        query="And the capital?",
+        choices=list(choices),
+        gold_index=0,
+        task_name="t",
+        generation_size=8,
+        fewshot_samples=history,
+        images=images,
+    )
+    doc.id = "0"
+    return doc
+
+
+def _generation_sdk():
+    sdk = MagicMock()
+    sdk.chat.completions.create = AsyncMock(return_value=make_sdk_chat_stream(["Paris."]))
+    sdk.completions.create = AsyncMock(return_value=make_sdk_completion_stream(["Paris."]))
+    sdk.__aenter__ = AsyncMock(return_value=sdk)
+    sdk.__aexit__ = AsyncMock(return_value=False)
+    return sdk
+
+
+class RecordingTokenizer(FakeTokenizer):
+    """FakeTokenizer that keeps the messages its chat template was given."""
+
+    def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True, **kwargs):
+        self.messages = messages
+        return super().apply_chat_template(messages, tokenize, add_generation_prompt, **kwargs)
+
+
+class TestDocOwnTurns:
+    """Earlier turns a prompt function puts on ``doc.fewshot_samples`` are in the request the client sends."""
+
+    def test_chat_generation_sends_them_before_the_final_turn(self):
+        client = make_client()
+        sdk = _generation_sdk()
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            (result,) = client.greedy_until([make_conversation_doc()])
+        assert sdk.chat.completions.create.call_args.kwargs["messages"] == [*EARLIER_TURNS, FINAL_TURN]
+        assert result.text == ["Paris."]
+
+    def test_a_tasks_docs_keep_them_on_the_way_to_the_request(self, tmp_path):
+        # From the prompt function through LightevalTask.get_docs to the chat request.
+        data_file = tmp_path / "conversations.jsonl"
+        data_file.write_text(
+            json.dumps({"text": "And the capital?", "history": [{"user": "Name a country.", "assistant": "France."}]})
+        )
+
+        def prompt_function(item, task_name):
+            history = [
+                Doc(query=turn["user"], choices=[turn["assistant"]], gold_index=0, task_name=task_name)
+                for turn in item["history"]
+            ]
+            return Doc(query=item["text"], choices=[""], gold_index=0, task_name=task_name, fewshot_samples=history)
+
+        config = LightevalTaskConfig(
+            name="conversation",
+            prompt_function=prompt_function,
+            hf_repo="json",
+            hf_subset="default",
+            metrics=[],
+            hf_avail_splits=["train"],
+            evaluation_splits=["train"],
+            few_shots_select="sequential",
+            generation_size=8,
+            hf_data_files=str(data_file),
+        )
+        config.num_fewshots = 0
+        docs = LightevalTask(config).get_docs()
+
+        client = make_client()
+        sdk = _generation_sdk()
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            client.greedy_until(docs)
+        assert sdk.chat.completions.create.call_args.kwargs["messages"] == [*EARLIER_TURNS, FINAL_TURN]
+
+    def test_text_generation_puts_them_before_the_query(self):
+        client = make_client(use_chat_template=False)
+        sdk = _generation_sdk()
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            client.greedy_until([make_conversation_doc()])
+        assert sdk.completions.create.call_args.kwargs["prompt"] == "Name a country. France.\n\nAnd the capital?"
+
+    def test_image_generation_sends_them_and_attaches_the_images_to_the_final_turn(self):
+        pil = pytest.importorskip("PIL.Image")
+        client = make_client()
+        sdk = _generation_sdk()
+        doc = make_conversation_doc(images=[pil.new("RGB", (2, 2))])
+        with patch.object(VLLMOpenAIClient, "_make_client", lambda self: sdk):
+            client.greedy_until([doc])
+        messages = sdk.chat.completions.create.call_args.kwargs["messages"]
+        assert messages[:2] == EARLIER_TURNS
+        assert len(messages) == 3 and messages[2]["role"] == "user"
+        parts = messages[2]["content"]
+        assert [part["text"] for part in parts if part["type"] == "text"] == ["And the capital?"]
+        assert [part["type"] for part in parts].count("image_url") == 1
+
+    def test_token_loglikelihood_renders_them_through_the_local_chat_template(self):
+        client = _token_client()
+        client._tokenizer = RecordingTokenizer()
+        sdk = MagicMock()
+        sdk.completions.create = AsyncMock(side_effect=lambda **kw: _echo_response_for(kw["prompt"]))
+
+        run(
+            client._process_doc_token_loglikelihood_async(make_conversation_doc([" Paris"]), sdk, asyncio.Semaphore(4))
+        )
+
+        assert client._tokenizer.messages == [*EARLIER_TURNS, FINAL_TURN]
+        context = "Name a country.France.And the capital?<gen>"
+        assert sdk.completions.create.call_args.kwargs["prompt"] == [ord(c) for c in context + " Paris"]
+
+    def test_server_templated_loglikelihood_sends_them_before_the_scored_reply(self):
+        client = make_client()
+        sdk = MagicMock()
+        sdk.chat.completions.create = AsyncMock(
+            return_value=make_sdk_chat_response(prompt_logprobs=make_prompt_logprobs_payload([("▁Paris", -0.5, 1)]))
+        )
+
+        run(client._process_doc_chat_loglikelihood_async(make_conversation_doc([" Paris"]), sdk, asyncio.Semaphore(4)))
+
+        assert sdk.chat.completions.create.call_args.kwargs["messages"] == [
+            *EARLIER_TURNS,
+            FINAL_TURN,
+            {"role": "assistant", "content": " Paris"},
+        ]
 
 
 # ---------------------------------------------------------------------------
