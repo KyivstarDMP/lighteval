@@ -79,21 +79,18 @@ def _run_call_api(
 
 
 @pytest.mark.parametrize(
-    "reasoning_effort, supports_reasoning_value, expected_prepared_max_new_tokens",
-    [
-        (None, True, 100),
-        ("none", True, 100),
-        ("low", False, 100),
-        ("low", True, 1000),
-    ],
+    "reasoning_effort, supports_reasoning_value",
+    [(None, True), ("none", True), ("low", False), ("low", True)],
 )
-def test_prepare_max_new_tokens_boosts_only_with_reasoning_effort(
-    reasoning_effort: str | None, supports_reasoning_value: bool, expected_prepared_max_new_tokens: int
+def test_prepare_max_new_tokens_sends_the_configured_limit(
+    reasoning_effort: str | None, supports_reasoning_value: bool
 ):
+    # no tenfold boost for reasoning models: a run that wants room for reasoning sets the limit
     client = _build_client("openai/o3-mini", GenerationParameters(reasoning_effort=reasoning_effort))
 
     with patch("lighteval.models.endpoints.litellm_model.supports_reasoning", return_value=supports_reasoning_value):
-        assert client._prepare_max_new_tokens(100) == expected_prepared_max_new_tokens
+        assert client._prepare_max_new_tokens(100) == 100
+        assert client._prepare_max_new_tokens(None) is None
 
 
 def test_call_api_o_series_keeps_reasoning_effort_but_drops_sampling_params():
@@ -128,7 +125,7 @@ def test_call_api_openai_reasoning_keeps_max_completion_tokens():
     client = _build_client("openai/gpt-5-mini", GenerationParameters(max_new_tokens=96, reasoning_effort="low"))
 
     completion_kwargs = _run_call_api(client, supports_reasoning=True).call_args.kwargs
-    assert completion_kwargs["max_tokens"] == 640
+    assert completion_kwargs["max_tokens"] == 64  # the task's limit, not boosted
     assert completion_kwargs["max_completion_tokens"] == 96
 
 
