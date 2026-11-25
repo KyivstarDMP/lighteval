@@ -21,8 +21,23 @@
 # SOFTWARE.
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 import torch
+
+
+class RequestFailure(str, Enum):
+    """Why a backend gave up on a doc's request."""
+
+    OVER_BUDGET = "over_budget"
+    REJECTED = "rejected"
+    STALLED = "stalled"
+    RETRIES_EXHAUSTED = "retries_exhausted"
+
+    @property
+    def retriable(self) -> bool:
+        """Whether asking again later can get an answer."""
+        return self in (RequestFailure.STALLED, RequestFailure.RETRIES_EXHAUSTED)
 
 
 @dataclass
@@ -127,6 +142,9 @@ class ModelResponse:
     output_tokens: list[list[int]] = field(default_factory=list)  # Model generations
     text_post_processed: list[str] | None = None  # The text of the response postprocessed
     reasonings: list[str | None] = field(default_factory=list)  # The reasoning content of the response
+    finish_reasons: list[str | None] = field(
+        default_factory=list
+    )  # Why each generation stopped: "stop", "length", ...
 
     # Model logprob outputs
     logprobs: list[float] = field(default_factory=list)  # Log probabilities of the response
@@ -137,6 +155,8 @@ class ModelResponse:
     # Other metadata
     truncated_tokens_count: int = 0  # How many tokens truncated
     padded_tokens_count: int = 0  # How many tokens of padding
+    error: RequestFailure | None = None  # Why the backend gave up on this doc's request; such a response is not cached
+    error_detail: str | None = None  # The error behind it, e.g. "BadRequestError: Error code: 400 - ..."
 
     @property
     def final_text(self) -> list[str]:
@@ -150,12 +170,15 @@ class ModelResponse:
             input_tokens=self.input_tokens,
             text=[self.text[index]],
             output_tokens=[self.output_tokens[index]] if self.output_tokens else [],
+            finish_reasons=[self.finish_reasons[index]] if self.finish_reasons else [],
             logprobs=[self.logprobs[index]] if self.logprobs else [],
             argmax_logits_eq_gold=[self.argmax_logits_eq_gold[index]] if self.argmax_logits_eq_gold else [],
             logits=[self.logits[index]] if self.logits else None,
             unconditioned_logprobs=[self.unconditioned_logprobs[index]] if self.unconditioned_logprobs else None,
             truncated_tokens_count=self.truncated_tokens_count,
             padded_tokens_count=self.padded_tokens_count,
+            error=self.error,
+            error_detail=self.error_detail,
         )
 
 

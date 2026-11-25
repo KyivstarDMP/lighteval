@@ -30,7 +30,7 @@ import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from decimal import Decimal
 from enum import Enum
-from io import StringIO
+from io import BytesIO, StringIO
 from types import ModuleType
 from typing import Callable, Optional
 
@@ -66,13 +66,41 @@ def timeout_handler(signum, frame):
     raise TimeoutException
 
 
+class _Stdin(StringIO):
+    """The test input as stdin, with the ``buffer`` real stdin has: ``sys.stdin.buffer.read()`` is the fast-input idiom."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.buffer = BytesIO(text.encode())
+
+
+class _BytesToText:
+    """``sys.stdout.buffer`` of the capture: what a program writes as bytes lands in the captured text, in order."""
+
+    def __init__(self, text: StringIO) -> None:
+        self._text = text
+
+    def write(self, data) -> int:
+        self._text.write(bytes(data).decode("utf-8", errors="replace"))
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+
+class _Stdout(StringIO):
+    def __init__(self) -> None:
+        super().__init__()
+        self.buffer = _BytesToText(self)
+
+
 # used to capture stdout as a list
 # from https://stackoverflow.com/a/16571630/6416660
 # alternative use redirect_stdout() from contextlib
 class Capturing(list):
     def __enter__(self):
         self._stdout = sys.stdout
-        sys.stdout = self._stringio = StringIO()
+        sys.stdout = self._stringio = _Stdout()
         # Make closing the StringIO a no-op
         self._stringio.close = lambda x: 1
         return self
@@ -136,7 +164,7 @@ def call_method(method: Callable, inputs: list | str):
     inputs_line_iterator = iter(inputs.split("\n"))
 
     @patch("builtins.open", mock_open(read_data=inputs))
-    @patch("sys.stdin", StringIO(inputs))
+    @patch("sys.stdin", _Stdin(inputs))
     @patch("sys.stdin.readline", lambda *args: next(inputs_line_iterator))
     @patch("sys.stdin.readlines", lambda *args: inputs.split("\n"))
     @patch("sys.stdin.read", lambda *args: inputs)

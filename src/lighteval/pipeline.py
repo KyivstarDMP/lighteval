@@ -355,6 +355,7 @@ class Pipeline:
                         remove_reasoning_tags(
                             text=text,
                             tag_pairs=self.pipeline_parameters.reasoning_tags,
+                            thinking=self.model.thinking,
                         )
                         for text in response.text
                     ]

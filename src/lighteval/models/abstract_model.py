@@ -23,7 +23,7 @@
 import json
 import re
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Union
+from typing import Any, ClassVar, Optional, Union
 
 import torch
 import yaml
@@ -91,6 +91,8 @@ class ModelConfig(BaseModel, extra="forbid"):
     image_placement: ImagePlacement = ImagePlacement.inline
     cache_dir: str = "~/.cache/huggingface/lighteval"
 
+    CACHE_KEY_EXCLUDE: ClassVar[frozenset[str]] = frozenset()
+
     @classmethod
     def from_path(cls, path: str):
         with open(path, "r") as f:
@@ -154,20 +156,57 @@ class ModelConfig(BaseModel, extra="forbid"):
                 return None
             return _parse_inline_dict(match.group(1))
 
-        # Looking for generation_parameters and chat_template_kwargs in the model_args
-        generation_parameters_dict = _extract_inline_dict(args, "generation_parameters")
-        chat_template_kwargs_dict = _extract_inline_dict(args, "chat_template_kwargs")
+        # Looking for generation_parameters, chat_template_kwargs and reasoning_config in the model_args
+        inline_fields = ("generation_parameters", "chat_template_kwargs", "reasoning_config")
+        inline_dicts = {name: _extract_inline_dict(args, name) for name in inline_fields}
+        for name in inline_fields:
+            args = re.sub(rf"{name}=\{{.*?\}},?", "", args).strip(",")
+        model_config = {}
+        for part in ModelConfig._split_top_level_args(args):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                model_config[key.strip()] = ModelConfig._strip_matching_quotes(value.strip())
+            else:
+                model_config[part.strip()] = True
 
-        args = re.sub(r"generation_parameters=\{.*?\},?", "", args).strip(",")
-        args = re.sub(r"chat_template_kwargs=\{.*?\},?", "", args).strip(",")
-        model_config = {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in args.split(",")}
-
-        if generation_parameters_dict is not None:
-            model_config["generation_parameters"] = generation_parameters_dict
-        if chat_template_kwargs_dict is not None:
-            model_config["chat_template_kwargs"] = chat_template_kwargs_dict
+        model_config.update({name: value for name, value in inline_dicts.items() if value is not None})
 
         return model_config
+
+    @staticmethod
+    def _split_top_level_args(args: str) -> list[str]:
+        """Split a comma-separated ``key=value`` string on top-level commas only.
+
+        A comma inside a quoted value (``system_prompt="Be helpful, concise"``)
+        does not start a new field — without this, a comma anywhere in a string
+        value (e.g. a system prompt) silently truncated it and turned the
+        remainder into a spurious boolean flag.
+        """
+        parts = []
+        current = []
+        quote_char = None
+        for char in args:
+            if quote_char:
+                current.append(char)
+                if char == quote_char:
+                    quote_char = None
+            elif char in "\"'":
+                quote_char = char
+                current.append(char)
+            elif char == ",":
+                parts.append("".join(current))
+                current = []
+            else:
+                current.append(char)
+        parts.append("".join(current))
+        return [part for part in parts if part]
+
+    @staticmethod
+    def _strip_matching_quotes(value: str) -> str:
+        """Strip a single layer of matching surrounding quotes, if present."""
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            return value[1:-1]
+        return value
 
 
 class InspectAIModelConfig(BaseModel):
@@ -217,7 +256,14 @@ class InspectAIModelConfig(BaseModel):
             }
         """
         args = re.sub(r"generation_parameters=\{.*?\},?", "", args).strip(",")
-        return {k.split("=")[0]: k.split("=")[1] if "=" in k else True for k in args.split(",")}
+        model_config = {}
+        for part in ModelConfig._split_top_level_args(args):
+            if "=" in part:
+                key, value = part.split("=", 1)
+                model_config[key.strip()] = ModelConfig._strip_matching_quotes(value.strip())
+            else:
+                model_config[part.strip()] = True
+        return model_config
 
     @classmethod
     def from_path(cls, path: str):
@@ -235,6 +281,9 @@ class InspectAIModelConfig(BaseModel):
 class LightevalModel(ABC):
     DATASET_SPLITS = 4
     is_async = False
+    # Whether the model was asked to think, when the backend knows it; None otherwise.
+    # Read when reasoning tags are removed: it decides whether a span that never closes is reasoning.
+    thinking: bool | None = None
 
     """Abstract model class defining the API that every model to plug into lighteval must follow."""
 

@@ -83,6 +83,10 @@ class TestCaching(unittest.TestCase):
             DummyModelConfig,
         ]
 
+        from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIModelConfig
+
+        model_configs.append(VLLMOpenAIModelConfig)
+
         for model_config in model_configs:
             with self.subTest(model_config=model_config):
                 with tempfile.TemporaryDirectory() as temp_dir:
@@ -90,7 +94,12 @@ class TestCaching(unittest.TestCase):
                     # if model_config in [AdapterModelConfig, DeltaModelConfig]:
                     #    config = model_config(model_name=model_name, base_model=model_name + "2", cache_dir=temp_dir)
                     # else:
-                    config = model_config(model_name=model_name, cache_dir=temp_dir)
+                    extra_kwargs = {}
+                    if model_config is VLLMOpenAIModelConfig:
+                        # base_url is deliberately required (the backend always
+                        # talks to an explicit server).
+                        extra_kwargs["base_url"] = "http://localhost:8000/v1"
+                    config = model_config(model_name=model_name, cache_dir=temp_dir, **extra_kwargs)
 
                     # Create cache with custom directory
                     cache = SampleCache(config)
@@ -127,6 +136,11 @@ class TestCaching(unittest.TestCase):
             SGLangModel,
             DummyModel,
         ]
+
+        from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIClient
+
+        model_classes.append(VLLMOpenAIClient)
+
         methods_to_check = ["greedy_until", "loglikelihood", "loglikelihood_rolling"]
 
         for model_class in model_classes:
@@ -343,3 +357,46 @@ class TestCaching(unittest.TestCase):
                     ("greedy_until", SamplingMethod.GENERATIVE),
                 ],
             )
+
+
+# Model hashes computed with SampleCache.get_model_hash before the thinking budget's config fields existed (commit
+# 55cdac5), for the configs below. A cache built then must keep its key while those fields are unset.
+HASH_BEFORE_THE_BUDGET_FIELDS = {"vllm_openai": "1816efef99496085", "litellm": "912057a5bdf9a46e"}
+
+
+def _model_hash(config) -> str:
+    return object.__new__(SampleCache).get_model_hash(config)  # the hash reads only the config
+
+
+def _http_config(**fields):
+    from lighteval.models.endpoints.vllm_openai_model import VLLMOpenAIModelConfig
+
+    return VLLMOpenAIModelConfig(
+        model_name="org/model-it",
+        base_url="http://localhost:8000/v1",
+        chat_template_kwargs={"enable_thinking": True},
+        **fields,
+    )
+
+
+def test_unset_budget_fields_keep_the_model_hash():
+    from lighteval.models.endpoints.litellm_model import LiteLLMModelConfig
+
+    generation = {"temperature": 0.6, "max_new_tokens": 512}
+    assert _model_hash(_http_config(generation_parameters=generation)) == HASH_BEFORE_THE_BUDGET_FIELDS["vllm_openai"]
+    api = LiteLLMModelConfig(model_name="openai/model-mini", generation_parameters=generation)
+    assert _model_hash(api) == HASH_BEFORE_THE_BUDGET_FIELDS["litellm"]
+
+
+def test_a_set_budget_changes_the_model_hash():
+    budgeted = _http_config(
+        generation_parameters={"temperature": 0.6, "max_new_tokens": 512, "thinking_token_budget": 256},
+        reasoning_config={"reasoning_start_str": "<think>", "reasoning_end_str": "</think>"},
+    )
+    other_budget = budgeted.model_copy(
+        update={
+            "generation_parameters": budgeted.generation_parameters.model_copy(update={"thinking_token_budget": 512})
+        }
+    )
+    hashes = {_model_hash(budgeted), _model_hash(other_budget), HASH_BEFORE_THE_BUDGET_FIELDS["vllm_openai"]}
+    assert len(hashes) == 3
