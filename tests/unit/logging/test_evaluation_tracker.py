@@ -297,6 +297,8 @@ class TestProperties(unittest.TestCase):
             "cache_implementation": None,
             "response_format": None,
             "reasoning_effort": None,
+            "skip_special_tokens": None,
+            "thinking_token_budget": None,
         }  # ruff: noqa: E501
         self.dummy_ref_config = {
             "model_name": "test/case",
